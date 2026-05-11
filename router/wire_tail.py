@@ -59,20 +59,64 @@ class WireTail:
                     pass
 
     async def _reader_loop(self, from_beginning: bool) -> None:
-        """Read lines from wire.jsonl and push parsed events to the queue."""
-        # Wait until file exists
+        """Read lines from wire.jsonl, push parsed events to the queue.
+
+        Handles file rotation (inode change) and truncation (size shrunk
+        below current offset) by reopening. Partial lines (no trailing
+        newline) are not consumed — we seek back and retry next tick.
+        """
+        # Wait until file exists initially
         while not self.path.exists() and not self._closed:
             await asyncio.sleep(0.5)
         if self._closed:
             return
 
-        with self.path.open("r", encoding="utf-8") as f:
-            if not from_beginning:
-                f.seek(0, 2)  # jump to EOF
+        f = None
+        current_inode: int | None = None
+        # First-time positioning: tail-from-EOF unless caller asked otherwise.
+        skip_to_eof = not from_beginning
+        try:
             while not self._closed:
+                try:
+                    st = self.path.stat()
+                except FileNotFoundError:
+                    # File got deleted; wait for it to reappear.
+                    if f:
+                        f.close()
+                        f = None
+                        current_inode = None
+                        skip_to_eof = False  # treat next open as a fresh file
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # (Re)open conditions: first open, inode change (rotation),
+                # or truncation below current read offset.
+                need_reopen = (
+                    f is None
+                    or st.st_ino != current_inode
+                    or (f.tell() > st.st_size)
+                )
+                if need_reopen:
+                    if f:
+                        f.close()
+                        log.info("wire.jsonl rotated/truncated, reopening")
+                    f = self.path.open("r", encoding="utf-8")
+                    current_inode = st.st_ino
+                    if skip_to_eof:
+                        f.seek(0, 2)
+                        skip_to_eof = False  # only on the very first open
+
+                pos = f.tell()
                 line = f.readline()
                 if not line:
                     await asyncio.sleep(0.3)
+                    continue
+                if not line.endswith("\n"):
+                    # Partial line — writer hasn't flushed end of record yet.
+                    # Seek back and retry next tick so we don't fragment a
+                    # JSON object across two readline() calls.
+                    f.seek(pos)
+                    await asyncio.sleep(0.1)
                     continue
                 line = line.strip()
                 if not line:
@@ -92,6 +136,9 @@ class WireTail:
                         self._queue.put_nowait(ev)
                     except asyncio.QueueEmpty:
                         pass
+        finally:
+            if f:
+                f.close()
 
     async def _dispatcher_loop(self) -> None:
         """Drain the queue and fan out to handlers with per-call timeout."""

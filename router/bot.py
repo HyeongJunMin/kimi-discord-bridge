@@ -3,7 +3,7 @@
 Replaces ACP with cmux surface + wire.jsonl tail.
 """
 from __future__ import annotations
-import asyncio, logging, os, time
+import asyncio, logging, os, signal, sqlite3, time
 from pathlib import Path
 from typing import Optional
 
@@ -677,12 +677,22 @@ async def rebind_cmd(interaction: discord.Interaction):
     old_sess.thread_id = new_thread.id
     router.sessions[new_thread.id] = old_sess
 
-    # Update registry
-    router.registry.conn.execute(
-        "UPDATE sessions SET thread_id=?, channel_id=? WHERE thread_id=?",
-        (str(new_thread.id), str(new_thread.parent_id), str(old_thread_id)),
-    )
-    router.registry.conn.commit()
+    # Update registry — wrap to roll back in-memory state on failure.
+    try:
+        router.registry.conn.execute(
+            "UPDATE sessions SET thread_id=?, channel_id=? WHERE thread_id=?",
+            (str(new_thread.id), str(new_thread.parent_id), str(old_thread_id)),
+        )
+        router.registry.conn.commit()
+    except sqlite3.IntegrityError as e:
+        # PK conflict — restore in-memory dict, surface error.
+        router.sessions.pop(new_thread.id, None)
+        old_sess.thread_id = old_thread_id
+        router.sessions[old_thread_id] = old_sess
+        log.error("rebind UPDATE failed: %s", e)
+        await interaction.followup.send(
+            f"⚠️ rebind 실패 (DB): {e}", ephemeral=True)
+        return
 
     # Update relay's thread reference
     if old_sess.relay:
@@ -718,6 +728,19 @@ async def on_message(msg: discord.Message):
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     if not before.archived and after.archived:
         await router.shutdown_session(after.id)
+    elif before.archived and not after.archived:
+        # Thread un-archived (manually) — surface was closed on archive,
+        # so this thread is just a corpse. Tell the user how to recover.
+        row = router.registry.get_by_thread(str(after.id))
+        if row and row.status == "dead":
+            try:
+                await after.send(
+                    "⚠️ 이 thread는 자동 보관 중 세션이 종료됐습니다.\n"
+                    "`/attach` 로 살아있는 surface에 연결하거나, "
+                    "`/new` 로 새 세션을 시작하세요."
+                )
+            except Exception:
+                log.exception("un-archive notice failed")
 
 
 @client.event
@@ -742,11 +765,53 @@ async def on_ready():
     log.info("bot online: %s", client.user)
 
 
+async def _shutdown() -> None:
+    """Best-effort cleanup: stop sessions (closes surfaces), close DB, log out."""
+    log.info("shutdown: closing %d active session(s)", len(router.sessions))
+    for tid in list(router.sessions):
+        try:
+            await router.shutdown_session(tid)
+        except Exception:
+            log.exception("session %s shutdown failed", tid)
+    try:
+        router.registry.conn.close()
+    except Exception:
+        log.exception("registry close failed")
+    try:
+        await client.close()
+    except Exception:
+        log.exception("client close failed")
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    def _handler():
+        log.info("signal received, beginning shutdown")
+        asyncio.create_task(_shutdown())
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handler)
+        except NotImplementedError:
+            # Windows or restricted env — fall back to default ^C behaviour.
+            pass
+
+
 def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN is not set (check .env)")
-    client.run(token)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _install_signal_handlers(loop)
+    try:
+        loop.run_until_complete(client.start(token))
+    except KeyboardInterrupt:
+        loop.run_until_complete(_shutdown())
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
 
 
 if __name__ == "__main__":

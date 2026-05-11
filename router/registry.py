@@ -49,8 +49,10 @@ class Registry:
         self.conn.commit()
 
     def insert(self, row: SessionRow) -> None:
+        # INSERT OR REPLACE so re-attaching to a thread whose row still
+        # exists (e.g. status='dead' from a prior crash) doesn't raise.
         self.conn.execute(
-            """INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (row.thread_id, row.guild_id, row.channel_id, row.owner_user_id,
              row.workspace_id, row.workspace_name, row.cwd, row.monitor_surface_id,
              row.acp_session_id, row.status, row.created_at, row.last_active_at),
