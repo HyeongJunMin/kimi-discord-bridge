@@ -126,7 +126,6 @@ class Router:
     async def _wait_for_session_uuid(self, surface_id: str, timeout: float = 25.0) -> str | None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            from .cmux_client import surface_read_text
             text = await surface_read_text(surface_id)
             if text:
                 m = SESSION_RE.search(text)
@@ -529,7 +528,7 @@ async def attach_cmd(interaction: discord.Interaction):
         ))
 
         await thread.send(
-            f"준비 완료. 메시지를 별낸면 kimi에 전달됩니다.\n"
+            f"준비 완료. 메시지를 보내면 kimi에 전달됩니다.\n"
             f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"
         )
         log.info("attach: session %s attached to thread %s", session_uuid, thread.id)
@@ -704,7 +703,7 @@ async def rebind_cmd(interaction: discord.Interaction):
     await new_thread.send(
         f"🔄 세션이 이곳으로 이동되었습니다.\n"
         f"session=`{old_sess.session_uuid[:8]}…` · surface `{old_sess.surface_id[:8]}…`\n"
-        f"메시지를 별낸면 kimi에 전달됩니다.")
+        f"메시지를 보내면 kimi에 전달됩니다.")
 
     log.info("rebind: session %s moved from thread %s to %s",
              old_sess.session_uuid, old_thread_id, new_thread.id)
