@@ -19,7 +19,8 @@ import discord
 from discord import app_commands
 
 from .cmux_client import (list_workspaces, create_workspace, create_surface,
-                          surface_send_text, close_surface, CmuxError)
+                          surface_send_text, surface_read_text, close_surface,
+                          CmuxError, list_surfaces)
 from .registry import Registry, SessionRow
 from .discord_relay import ThreadRelay, SESSION_RE, wait_for_wire_jsonl
 
@@ -381,29 +382,253 @@ async def model_cmd(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(f"🤖 `/model {name}` 전송 완료", ephemeral=True)
 
 
-@tree.command(name="cleanup", description="고아 세션을 정리합니다 (삭제/아카이브된 thread)")
-async def cleanup_cmd(interaction: discord.Interaction):
-    active = router.registry.list_active()
-    cleaned = 0
-    for r in active:
-        try:
-            thread = client.get_channel(int(r.thread_id))
-            if thread is None:
-                # thread가 삭제됨
-                router.sessions.pop(int(r.thread_id), None)
-                router.registry.update_status(r.thread_id, "dead")
-                cleaned += 1
-                log.info("cleanup: thread %s deleted, marked dead", r.thread_id)
-            elif thread.archived:
-                # thread가 아카이브됨
-                await router.shutdown_session(int(r.thread_id))
-                cleaned += 1
-                log.info("cleanup: thread %s archived, shutdown", r.thread_id)
-        except Exception as e:
-            log.warning("cleanup error for thread %s: %s", r.thread_id, e)
+@tree.command(name="attach", description="로컬에서 실행 중인 kimi-cli를 Discord thread에 연결합니다")
+async def attach_cmd(interaction: discord.Interaction):
+    """Attach an already-running local kimi surface to a new Discord thread."""
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("텍스트 채널에서만 사용 가능해요.", ephemeral=True)
+        return
 
-    await interaction.response.send_message(
-        f"🧹 정리 완료: {cleaned}개의 고아 세션을 정리했습니다.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    # 1. Collect all workspaces
+    try:
+        wss = await list_workspaces()
+    except CmuxError as e:
+        await interaction.followup.send(f"cmux 호출 실패: {e}", ephemeral=True)
+        return
+
+    # 2. Gather candidate surfaces (with session UUID)
+    candidates: list[dict] = []
+    registered_surface_ids = {
+        r.monitor_surface_id for r in router.registry.list_active()
+        if r.monitor_surface_id
+    }
+
+    for ws in wss:
+        ws_id = ws.get("id") or ws.get("ref")
+        if not ws_id:
+            continue
+        try:
+            surfaces = await list_surfaces(ws_id)
+        except CmuxError:
+            continue
+        for surf in surfaces:
+            surf_id = surf.get("id") or surf.get("surface_id") or surf.get("ref")
+            if not surf_id:
+                continue
+            if surf_id in registered_surface_ids:
+                continue  # already attached
+            # Quick check: read text and look for session UUID
+            try:
+                text = await surface_read_text(surf_id)
+            except CmuxError:
+                continue
+            if not text:
+                continue
+            m = SESSION_RE.search(text)
+            if not m:
+                continue
+            session_uuid = m.group(1)
+
+            # Try to extract cwd from screen text first (more reliable than
+            # requested_working_directory which is often null)
+            cwd_from_screen = None
+            for line in text.splitlines():
+                if line.strip().startswith("Directory:"):
+                    parts = line.strip().split("Directory:", 1)
+                    if len(parts) == 2:
+                        cwd_from_screen = parts[1].strip()
+                        break
+
+            cwd = cwd_from_screen or surf.get("requested_working_directory") or DEFAULT_WORK_DIR
+            title = surf.get("title") or f"surface:{surf_id}"
+            candidates.append({
+                "surface_id": surf_id,
+                "workspace_id": ws_id,
+                "workspace_name": ws.get("title") or ws.get("name") or ws_id,
+                "session_uuid": session_uuid,
+                "cwd": cwd,
+                "title": title,
+            })
+
+    if not candidates:
+        await interaction.followup.send(
+            "연결할 수 있는 kimi surface를 찾지 못했어요. (이미 등록되었거나, session banner가 보이지 않는 surface)",
+            ephemeral=True)
+        return
+
+    # 3. Build select options (Discord limit: 25)
+    options = []
+    _candidate_map: dict[str, dict] = {}
+    for c in candidates[:25]:
+        label = c["title"][:100]
+        desc = f"{c['workspace_name'][:40]} · {c['session_uuid'][:8]}…"
+        val = c["surface_id"]
+        _candidate_map[val] = c
+        options.append(discord.SelectOption(label=label, value=val, description=desc))
+
+    select = discord.ui.Select(placeholder="연결할 surface 선택", options=options)
+
+    async def on_select(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True)
+        val = select.values[0]
+        cand = _candidate_map[val]
+        surf_id = cand["surface_id"]
+        ws_id = cand["workspace_id"]
+        ws_name = cand["workspace_name"]
+        session_uuid = cand["session_uuid"]
+        cwd = cand["cwd"]
+
+        # Create thread
+        thread = await inter.channel.create_thread(
+            name=f"kimi-attach-{session_uuid[:8]}-{int(time.time())%10000}",
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=1440,
+        )
+        await inter.followup.send(
+            f"✓ Thread 생성: {thread.mention}", ephemeral=True)
+        await thread.send(
+            f"🔗 로컬 surface를 연결 중...\n"
+            f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"
+        )
+
+        # Build WireSession without creating a new surface
+        sess = WireSession(
+            thread_id=thread.id,
+            surface_id=surf_id,
+            session_uuid=session_uuid,
+            cwd=cwd,
+            owner_id=inter.user.id,
+        )
+        await sess.start_relay(thread, client)
+        router.sessions[thread.id] = sess
+
+        # Start tail eagerly (surface already has kimi running)
+        wire_path = await wait_for_wire_jsonl(session_uuid, cwd, max_wait=30.0)
+        if wire_path and sess.relay:
+            await sess.relay.start_tail(wire_path, client)
+        elif sess.relay:
+            await thread.send("⚠️ wire.jsonl 찾기 실패 — 응답 수신이 불가능할 수 있습니다.")
+
+        # Register in DB
+        router.registry.insert(SessionRow(
+            thread_id=str(thread.id),
+            guild_id=str(thread.guild.id) if thread.guild else None,
+            channel_id=str(thread.parent_id),
+            owner_user_id=str(inter.user.id),
+            workspace_id=ws_id,
+            workspace_name=ws_name,
+            cwd=cwd,
+            monitor_surface_id=surf_id,
+            acp_session_id=session_uuid,
+            status="active",
+            created_at=int(time.time()),
+            last_active_at=int(time.time()),
+        ))
+
+        await thread.send(
+            f"준비 완료. 메시지를 별낸면 kimi에 전달됩니다.\n"
+            f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"
+        )
+        log.info("attach: session %s attached to thread %s", session_uuid, thread.id)
+
+    select.callback = on_select
+    view = discord.ui.View(timeout=120)
+    view.add_item(select)
+    await interaction.followup.send("연결할 surface를 선택하세요:", view=view, ephemeral=True)
+
+
+@tree.command(name="cleanup", description="Discord의 고아 thread를 정리합니다 (registry에 없는 thread)")
+async def cleanup_cmd(interaction: discord.Interaction):
+    """Find active Discord threads that are NOT registered in the registry and clean them up."""
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("텍스트 채널에서만 사용 가능해요.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # 1. Fetch all active threads in the guild
+    try:
+        active_threads = await interaction.guild.active_threads()
+    except Exception as e:
+        await interaction.followup.send(f"thread 목록 조회 실패: {e}", ephemeral=True)
+        return
+
+    # 2. Filter threads that belong to this channel
+    channel_threads = [
+        t for t in active_threads
+        if t.parent_id == interaction.channel.id
+    ]
+
+    if not channel_threads:
+        await interaction.followup.send("이 채널에 활성 thread가 없어요.", ephemeral=True)
+        return
+
+    # 3. Find threads not in registry
+    registered_thread_ids = {
+        r.thread_id for r in router.registry.list_active()
+    }
+    orphan_threads = [
+        t for t in channel_threads
+        if str(t.id) not in registered_thread_ids
+    ]
+
+    if not orphan_threads:
+        await interaction.followup.send(
+            "🧹 정리할 고아 thread가 없어요. 모든 활성 thread가 registry에 등록되어 있습니다.",
+            ephemeral=True)
+        return
+
+    # 4. Present options to archive them
+    options = []
+    _thread_map: dict[str, discord.Thread] = {}
+    for t in orphan_threads[:25]:
+        label = t.name[:100]
+        _thread_map[str(t.id)] = t
+        options.append(discord.SelectOption(
+            label=label,
+            value=str(t.id),
+            description="이 thread를 아카이브합니다"))
+
+    # Add "all" option if within limit
+    if len(options) < 25:
+        options.insert(0, discord.SelectOption(
+            label="🧹 모두 아카이브",
+            value="__all__",
+            description=f"{len(orphan_threads)}개의 고아 thread를 모두 아카이브"))
+
+    select = discord.ui.Select(placeholder="아카이브할 고아 thread 선택", options=options)
+
+    async def on_select(inter: discord.Interaction):
+        val = select.values[0]
+        if val == "__all__":
+            targets = list(_thread_map.values())
+        else:
+            targets = [_thread_map.get(val)]
+            targets = [t for t in targets if t]
+
+        archived = 0
+        errors = []
+        for t in targets:
+            try:
+                await t.edit(archived=True)
+                archived += 1
+            except Exception as e:
+                errors.append(f"{t.name}: {e}")
+                log.warning("cleanup archive failed for thread %s: %s", t.id, e)
+
+        msg_parts = [f"🧹 {archived}개의 고아 thread를 아카이브했습니다."]
+        if errors:
+            msg_parts.append(f"⚠️ 실패 {len(errors)}개: " + ", ".join(errors[:3]))
+        await inter.response.send_message("\n".join(msg_parts), ephemeral=True)
+
+    select.callback = on_select
+    view = discord.ui.View(timeout=120)
+    view.add_item(select)
+    await interaction.followup.send(
+        f"**{len(orphan_threads)}개의 고아 thread**를 발견했습니다. 아카이브할 thread를 선택하세요:",
+        view=view, ephemeral=True)
 
 
 @tree.command(name="rebind", description="현재 세션을 새 Discord thread로 옮깁니다")
@@ -499,9 +724,20 @@ async def on_ready():
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
+        try:
+            synced = await tree.sync(guild=guild)
+            log.info("synced %d commands to guild %s: %s",
+                     len(synced), GUILD_ID,
+                     [c.name for c in synced])
+        except Exception as e:
+            log.error("command sync failed: %s", e)
     else:
-        await tree.sync()
+        try:
+            synced = await tree.sync()
+            log.info("synced %d global commands: %s",
+                     len(synced), [c.name for c in synced])
+        except Exception as e:
+            log.error("command sync failed: %s", e)
     log.info("bot online: %s", client.user)
 
 

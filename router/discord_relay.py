@@ -20,7 +20,8 @@ KIMI_SESSIONS_DIR = Path.home() / ".kimi" / "sessions"
 
 
 def work_dir_hash(cwd: str) -> str:
-    return hashlib.md5(os.path.abspath(cwd).encode()).hexdigest()
+    expanded = os.path.expanduser(cwd)
+    return hashlib.md5(os.path.abspath(expanded).encode()).hexdigest()
 
 
 def compute_wire_path(session_uuid: str, cwd: str) -> Path:
@@ -30,9 +31,11 @@ def compute_wire_path(session_uuid: str, cwd: str) -> Path:
 
 async def wait_for_wire_jsonl(session_uuid: str, cwd: str, max_wait: float = 30.0) -> Path | None:
     wire_path = compute_wire_path(session_uuid, cwd)
+    log.info("wait_for_wire_jsonl: cwd=%r hash=%s expected=%s", cwd, work_dir_hash(cwd), wire_path)
     deadline = time.time() + max_wait
     while time.time() < deadline:
         if wire_path.exists():
+            log.info("wait_for_wire_jsonl: found at expected path")
             return wire_path
         await asyncio.sleep(0.5)
     # Fallback search
@@ -45,7 +48,9 @@ async def wait_for_wire_jsonl(session_uuid: str, cwd: str, max_wait: float = 30.
         d = Path(line.strip())
         wire = d / "wire.jsonl"
         if wire.exists():
+            log.info("wait_for_wire_jsonl: found via fallback at %s", wire)
             return wire
+    log.warning("wait_for_wire_jsonl: not found for session %s cwd %s", session_uuid, cwd)
     return None
 
 

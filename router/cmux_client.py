@@ -40,6 +40,14 @@ async def list_workspaces() -> list[dict]:
     return res.get("workspaces", [])
 
 
+async def list_surfaces(workspace_id: str) -> list[dict]:
+    """Returns list of surface dicts in the given workspace."""
+    res = await _rpc("surface.list", {"workspace_id": workspace_id})
+    if not res:
+        return []
+    return res.get("surfaces", [])
+
+
 async def create_workspace(*, name: str | None = None, cwd: str | None = None) -> dict:
     """Create a workspace; returns the workspace info dict."""
     params: dict = {}
