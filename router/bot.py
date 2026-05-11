@@ -186,6 +186,17 @@ async def new_session_cmd(interaction: discord.Interaction):
     select = discord.ui.Select(placeholder="워크스페이스 선택", options=options)
 
     async def on_select(inter: discord.Interaction):
+        # Channel check must happen before defer so we can use the
+        # synchronous send_message path for the early return.
+        if not isinstance(inter.channel, discord.TextChannel):
+            await inter.response.send_message(
+                "텍스트 채널에서만 가능해요.", ephemeral=True)
+            return
+
+        # workspace.create (if "__new__") + create_thread are both Discord/cmux
+        # round-trips; defer first to stay under the 3s interaction deadline.
+        await inter.response.defer(ephemeral=True)
+
         val = select.values[0]
         if val == "__new__":
             ws = await create_workspace(name=f"kimi-{inter.user.name}",
@@ -198,17 +209,12 @@ async def new_session_cmd(interaction: discord.Interaction):
             cwd = _ws_cwd_map.get(ws_id, DEFAULT_WORK_DIR)
             ws_name = next((o.label for o in options if o.value == val), None)
 
-        # Create thread off the channel where /new was invoked
-        if not isinstance(inter.channel, discord.TextChannel):
-            await inter.response.send_message(
-                "텍스트 채널에서만 가능해요.", ephemeral=True)
-            return
         thread = await inter.channel.create_thread(
             name=f"kimi-{ws_name or ws_id}-{int(time.time())%10000}",
             type=discord.ChannelType.public_thread,
             auto_archive_duration=1440,
         )
-        await inter.response.send_message(
+        await inter.followup.send(
             f"✓ 세션 생성: {thread.mention}", ephemeral=True)
 
         await thread.send(f"🚀 `kimi` TUI 기동 중... (cwd: `{cwd}`)")
@@ -268,12 +274,15 @@ async def kill_cmd(interaction: discord.Interaction):
     select = discord.ui.Select(placeholder="종료할 세션 선택", options=options)
 
     async def on_select(inter: discord.Interaction):
+        # shutdown_session calls cmux surface.close + sqlite update;
+        # ~1-2s typical. Defer to avoid the 3s interaction deadline.
+        await inter.response.defer(ephemeral=True)
         thread_id = int(select.values[0])
         thread = client.get_channel(thread_id)
-        await inter.response.send_message("🛑 세션 종료 중...", ephemeral=True)
         await router.shutdown_session(thread_id)
         if thread:
             await thread.send("✓ 이 세션이 종료되었습니다.")
+        await inter.followup.send("🛑 세션 종료 완료", ephemeral=True)
 
     select.callback = on_select
     view = discord.ui.View(timeout=120)
@@ -542,7 +551,7 @@ async def attach_cmd(interaction: discord.Interaction):
     await interaction.followup.send("연결할 surface를 선택하세요:", view=view, ephemeral=True)
 
 
-@tree.command(name="cleanup", description="Discord의 고아 thread를 정리합니다 (registry에 없는 thread)")
+@tree.command(name="cleanup", description="고아 thread를 삭제합니다 (registry에 없는 thread, 복구 불가)")
 async def cleanup_cmd(interaction: discord.Interaction):
     """Find active Discord threads that are NOT registered in the registry and clean them up."""
     if not isinstance(interaction.channel, discord.TextChannel):
@@ -583,7 +592,7 @@ async def cleanup_cmd(interaction: discord.Interaction):
             ephemeral=True)
         return
 
-    # 4. Present options to archive them
+    # 4. Present options to delete them
     options = []
     _thread_map: dict[str, discord.Thread] = {}
     for t in orphan_threads[:25]:
@@ -592,18 +601,22 @@ async def cleanup_cmd(interaction: discord.Interaction):
         options.append(discord.SelectOption(
             label=label,
             value=str(t.id),
-            description="이 thread를 아카이브합니다"))
+            description="이 thread를 삭제합니다 (복구 불가)"))
 
     # Add "all" option if within limit
     if len(options) < 25:
         options.insert(0, discord.SelectOption(
-            label="🧹 모두 아카이브",
+            label="🗑️ 모두 삭제",
             value="__all__",
-            description=f"{len(orphan_threads)}개의 고아 thread를 모두 아카이브"))
+            description=f"{len(orphan_threads)}개를 모두 삭제 (복구 불가)"))
 
-    select = discord.ui.Select(placeholder="아카이브할 고아 thread 선택", options=options)
+    select = discord.ui.Select(placeholder="삭제할 고아 thread 선택", options=options)
 
     async def on_select(inter: discord.Interaction):
+        # Deleting N threads = N Discord API calls; can exceed the 3s
+        # interaction deadline. Defer first.
+        await inter.response.defer(ephemeral=True)
+
         val = select.values[0]
         if val == "__all__":
             targets = list(_thread_map.values())
@@ -611,26 +624,26 @@ async def cleanup_cmd(interaction: discord.Interaction):
             targets = [_thread_map.get(val)]
             targets = [t for t in targets if t]
 
-        archived = 0
+        deleted = 0
         errors = []
         for t in targets:
             try:
-                await t.edit(archived=True)
-                archived += 1
+                await t.delete()
+                deleted += 1
             except Exception as e:
                 errors.append(f"{t.name}: {e}")
-                log.warning("cleanup archive failed for thread %s: %s", t.id, e)
+                log.warning("cleanup delete failed for thread %s: %s", t.id, e)
 
-        msg_parts = [f"🧹 {archived}개의 고아 thread를 아카이브했습니다."]
+        msg_parts = [f"🗑️ {deleted}개의 고아 thread를 삭제했습니다."]
         if errors:
             msg_parts.append(f"⚠️ 실패 {len(errors)}개: " + ", ".join(errors[:3]))
-        await inter.response.send_message("\n".join(msg_parts), ephemeral=True)
+        await inter.followup.send("\n".join(msg_parts), ephemeral=True)
 
     select.callback = on_select
     view = discord.ui.View(timeout=120)
     view.add_item(select)
     await interaction.followup.send(
-        f"**{len(orphan_threads)}개의 고아 thread**를 발견했습니다. 아카이브할 thread를 선택하세요:",
+        f"**{len(orphan_threads)}개의 고아 thread**를 발견했습니다. 삭제할 thread를 선택하세요:",
         view=view, ephemeral=True)
 
 
