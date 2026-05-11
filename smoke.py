@@ -37,7 +37,7 @@ async def main():
 
     try:
         # 3. Start kimi
-        await surface_send_text(surf_id, "kimi\n")
+        await surface_send_text(surf_id, "KIMI_CLI_NO_AUTO_UPDATE=1 kimi\n")
         print("kimi started", flush=True)
 
         # 4. Wait for session UUID

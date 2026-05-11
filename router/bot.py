@@ -88,8 +88,11 @@ class Router:
         if not surf_id:
             raise RuntimeError("Failed to create cmux surface")
 
-        # Start kimi in the surface
-        await surface_send_text(surf_id, "kimi\n")
+        # Start kimi in the surface.
+        # KIMI_CLI_NO_AUTO_UPDATE=1 suppresses the interactive upgrade gate
+        # that blocks the welcome banner (and thus session UUID extraction)
+        # when a new kimi-cli release exists. See kimi_cli/ui/shell/update.py.
+        await surface_send_text(surf_id, "KIMI_CLI_NO_AUTO_UPDATE=1 kimi\n")
 
         # Wait for banner and extract session UUID
         session_uuid = await self._wait_for_session_uuid(surf_id)
