@@ -22,7 +22,7 @@ from .cmux_client import (list_workspaces, create_workspace, create_surface,
                           surface_send_text, surface_read_text, close_surface,
                           CmuxError, list_surfaces)
 from .registry import Registry, SessionRow
-from .discord_relay import ThreadRelay, SESSION_RE, wait_for_wire_jsonl
+from .discord_relay import ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl
 
 log = logging.getLogger("router.bot")
 logging.basicConfig(level=logging.INFO,
@@ -337,8 +337,11 @@ async def clear_cmd(interaction: discord.Interaction):
     if not sess:
         await interaction.response.send_message("세션 객체를 찾을 수 없어요.", ephemeral=True)
         return
+    # send_to_surface may call ensure_tail which can wait up to 30s.
+    # Defer first so we never trip Discord's 3-second interaction deadline.
+    await interaction.response.defer(ephemeral=True)
     await sess.send_to_surface("/clear", client)
-    await interaction.response.send_message("🧹 `/clear` 전송 완료", ephemeral=True)
+    await interaction.followup.send("🧹 `/clear` 전송 완료", ephemeral=True)
 
 
 @tree.command(name="yolo", description="승인 모드를 토글합니다 (/yolo)")
@@ -357,8 +360,9 @@ async def yolo_cmd(interaction: discord.Interaction):
     if not sess:
         await interaction.response.send_message("세션 객체를 찾을 수 없어요.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     await sess.send_to_surface("/yolo", client)
-    await interaction.response.send_message("⚡ `/yolo` 전송 완료", ephemeral=True)
+    await interaction.followup.send("⚡ `/yolo` 전송 완료", ephemeral=True)
 
 
 @tree.command(name="model", description="모델을 변경합니다 (/model)")
@@ -378,8 +382,9 @@ async def model_cmd(interaction: discord.Interaction, name: str):
     if not sess:
         await interaction.response.send_message("세션 객체를 찾을 수 없어요.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     await sess.send_to_surface(f"/model {name}", client)
-    await interaction.response.send_message(f"🤖 `/model {name}` 전송 완료", ephemeral=True)
+    await interaction.followup.send(f"🤖 `/model {name}` 전송 완료", ephemeral=True)
 
 
 @tree.command(name="attach", description="로컬에서 실행 중인 kimi-cli를 Discord thread에 연결합니다")
@@ -431,17 +436,13 @@ async def attach_cmd(interaction: discord.Interaction):
                 continue
             session_uuid = m.group(1)
 
-            # Try to extract cwd from screen text first (more reliable than
-            # requested_working_directory which is often null)
-            cwd_from_screen = None
-            for line in text.splitlines():
-                if line.strip().startswith("Directory:"):
-                    parts = line.strip().split("Directory:", 1)
-                    if len(parts) == 2:
-                        cwd_from_screen = parts[1].strip()
-                        break
-
-            cwd = cwd_from_screen or surf.get("requested_working_directory") or DEFAULT_WORK_DIR
+            # Banner's "Directory:" line is the authoritative cwd source.
+            # cmux's requested_working_directory is often None for surfaces
+            # started without an explicit cwd, which leads to a wrong
+            # wire.jsonl hash and "not found" failures.
+            dir_m = DIRECTORY_RE.search(text)
+            cwd = (dir_m.group(1) if dir_m
+                   else surf.get("requested_working_directory") or DEFAULT_WORK_DIR)
             title = surf.get("title") or f"surface:{surf_id}"
             candidates.append({
                 "surface_id": surf_id,

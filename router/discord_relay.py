@@ -16,6 +16,7 @@ MAX_MSG_CHARS = 1900    # leave headroom under Discord's 2000 limit
 MAX_EDIT_CHARS = 1900   # threshold to roll over to a new message
 
 SESSION_RE = re.compile(r"Session:\s+([0-9a-fA-F-]{36})")
+DIRECTORY_RE = re.compile(r"Directory:\s+(\S+)")
 KIMI_SESSIONS_DIR = Path.home() / ".kimi" / "sessions"
 
 
@@ -174,5 +175,15 @@ class ThreadRelay:
         self._current_msg = None
 
     async def stop(self) -> None:
+        # Cancel any pending debounce flush so it does not try to send
+        # to a thread that may already be gone.
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("pending flush errored during stop")
         if self.tail:
             await self.tail.stop()
