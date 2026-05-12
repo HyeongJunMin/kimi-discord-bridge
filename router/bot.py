@@ -502,20 +502,36 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+RENAME_THREAD_TIMEOUT_S = 10  # Discord rate-limit guard
+
+
 async def _do_rename(thread: discord.Thread, new_name: str, row) -> str:
     """Rename a Discord thread and (if active) its bound cmux surface.
 
     Pre-condition: caller has already validated permissions and that
     new_name is non-empty after strip. Returns a one-line status message
     suitable for ephemeral followup.
+
+    Discord rate-limits thread renames to 2 per 10 minutes per channel.
+    When the client-side limiter would block, discord.py silently sleeps
+    for the full retry-after window (can be 7+ minutes). We cap that with
+    asyncio.wait_for so /rename fails fast and tells the user, instead of
+    leaving them staring at "thinking…".
     """
     truncated = new_name[:100]  # Discord thread.name limit
     truncated_note = " (100자 초과로 자름)" if len(new_name) > 100 else ""
 
     parts: list[str] = []
     try:
-        await thread.edit(name=truncated)
+        await asyncio.wait_for(thread.edit(name=truncated),
+                                timeout=RENAME_THREAD_TIMEOUT_S)
         parts.append(f"thread ✓{truncated_note}")
+    except asyncio.TimeoutError:
+        log.warning("thread.edit hit Discord rate limit (>%ss)",
+                    RENAME_THREAD_TIMEOUT_S)
+        parts.append(
+            "thread ⚠️ Discord 제한 (스레드 이름 변경은 10분에 2회까지). "
+            "잠시 후 다시 시도하세요")
     except Exception as e:
         log.warning("thread.edit failed: %s", e)
         parts.append(f"thread ⚠️ 실패 ({e})")

@@ -1,5 +1,6 @@
 """bot._kill_session_and_thread — session shutdown + surface verify + delete."""
 from __future__ import annotations
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -325,6 +326,30 @@ async def test_do_rename_reports_surface_failure():
         status = await bot._do_rename(thread, "x", _row_for_rename())
     assert "thread ✓" in status
     assert "surface ⚠️ 실패" in status
+
+
+async def test_do_rename_fails_fast_on_discord_rate_limit(monkeypatch):
+    """Discord rate-limits thread renames to 2/10min. discord.py would
+    auto-sleep through the whole retry-after window (7+ min) which leaves
+    the user staring at 'thinking…'. We cap with asyncio.wait_for and
+    report the limit instead."""
+    monkeypatch.setattr(bot, "RENAME_THREAD_TIMEOUT_S", 0.3)
+
+    thread = MagicMock()
+
+    async def slow_edit(**kwargs):
+        # Simulate discord.py's internal rate-limit sleep.
+        await asyncio.sleep(5)
+
+    thread.edit = slow_edit
+
+    # surface rename should still succeed independently.
+    with patch.object(bot, "rename_tab", new=AsyncMock()) as rt:
+        status = await bot._do_rename(thread, "x", _row_for_rename())
+
+    assert "thread ⚠️ Discord 제한" in status
+    assert "surface ✓" in status
+    rt.assert_awaited_once()
 
 
 async def test_create_session_continues_when_rename_fails(monkeypatch):
