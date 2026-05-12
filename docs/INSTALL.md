@@ -99,35 +99,37 @@ pip install -r requirements.txt
 
 ---
 
-## 단계 4 — Moonshot API 키
+## 단계 4 — Moonshot API 키 확보
 
-### 사용자에게 물을 것
+### 사용자에게 안내
 - `MOONSHOT_API_KEY` 가지고 계신가요? (없으면 [https://platform.moonshot.ai](https://platform.moonshot.ai) 에서 발급 안내)
+- **이 단계에서 도구에게 키 값을 전달하지 마세요.** 직접 갖고 계시다가 단계 7 에서 봇이 프롬프트할 때 입력합니다.
 
 ### 도구가 받아야 할 값
-- `MOONSHOT_API_KEY` (필수)
+- 없음. *키 보유 여부*만 사용자에게 확인.
 
 ---
 
-## 단계 5 — `.env` 파일 생성
+## 단계 5 — `.env` 파일 생성 (비밀 *없음*)
+
+> 이 봇은 비밀(Discord 토큰, Moonshot API 키)을 `.env` 가 아닌 **macOS Keychain** 에 보관합니다. `.env` 에는 비밀이 아닌 설정 값만 들어갑니다. 이렇게 하면 AI 코딩 도구가 작업 도중 `.env` 를 읽어도 비밀이 도구 컨텍스트에 흘러들어가지 않습니다.
 
 ### 도구가 실행
 1. `.env.example`을 복사하여 `.env`를 만든다.
    ```bash
    cp .env.example .env
    ```
-2. 단계 3, 4에서 받은 값을 채워 넣는다. **Edit 도구를 사용해서 정확히 다음 키만 치환**한다 (다른 키는 손대지 않는다):
-   - `DISCORD_TOKEN=` → `DISCORD_TOKEN=<단계3에서 받은 토큰>`
-   - `DISCORD_GUILD_ID=` → 사용자가 알려준 경우에만 채움
-   - (필요시) `DEFAULT_WORK_DIR=` → 사용자에게 기본 작업 디렉터리를 묻는다 (기본 제안: `$HOME/IdeaProjects`)
-3. `MOONSHOT_API_KEY`는 `.env`에 넣어도 되고, 사용자 셸 rc에 넣어도 된다. 도구는 사용자에게 선택지를 주고 진행한다.
-   - 옵션 A: `.env`에 `MOONSHOT_API_KEY=sk-...` 한 줄 추가 (kimi-cli가 이 봇과 같은 프로세스 트리에서 환경변수를 상속받으므로 동작함)
-   - 옵션 B: `~/.zshrc` 등에 `export MOONSHOT_API_KEY=sk-...` 추가 후 새 셸에서 봇 실행
+2. `.env` 의 비밀이 아닌 값만 채워 넣는다 (Edit 도구 사용):
+   - `DISCORD_GUILD_ID=` → 단계 3 에서 사용자가 알려준 경우에만 채움
+   - `DEFAULT_WORK_DIR=` → 사용자에게 기본 작업 디렉터리를 묻는다 (기본 제안: `$HOME/IdeaProjects`)
+3. **`.env` 에 `DISCORD_TOKEN`, `MOONSHOT_API_KEY` 값을 적지 않는다.** `.env.example` 에는 이 두 키가 아예 없거나 주석 처리되어 있어야 정상.
 
 ### 검증
 ```bash
-grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
+grep -E '^DISCORD_TOKEN=' .env && echo "❌ .env 에 DISCORD_TOKEN 라인이 있습니다 — 삭제하세요" || echo "OK"
+grep -E '^MOONSHOT_API_KEY=' .env && echo "❌ .env 에 MOONSHOT_API_KEY 라인이 있습니다 — 삭제하세요" || echo "OK"
 ```
+둘 다 OK 가 떠야 함.
 
 ---
 
@@ -148,25 +150,47 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 
 ---
 
-## 단계 7 — 봇 첫 실행
+## 단계 7 — 봇 첫 실행 (사용자가 직접 실행, 토큰 1회 입력)
 
-### 도구가 실행
+> ⚠️ **이 단계만 도구가 실행하지 않고 사용자에게 양도한다.** 이유: 비밀 입력 프롬프트는 사용자 터미널의 TTY 가 필요하고, 더 중요하게는 토큰값이 도구 컨텍스트에 흘러들어가지 않도록 사용자가 자기 터미널에 직접 타이핑해야 한다.
+
+### 도구가 사용자에게 안내
+사용자의 터미널에서 **다음 명령을 직접 실행해 주세요**:
 ```bash
-.venv/bin/python -m router.bot
+./run-bot.sh
 ```
+- 처음 실행 시 두 번 프롬프트가 뜬다:
+  - `🔐 Discord 봇 토큰 (입력은 화면에 표시되지 않습니다):` → 단계 3 에서 받은 토큰 붙여넣기 후 Enter
+  - `🔐 Moonshot API 키 (입력은 화면에 표시되지 않습니다):` → 단계 4 에서 갖고 있던 키 붙여넣기 후 Enter
+- 두 값은 macOS Keychain (service=`kimi-bridge`) 에 저장된다. 이후 실행부턴 프롬프트 없이 silent 시작.
+- 정상 시작 출력:
+  ```
+  ... INFO router.bot: synced N commands to guild ...
+  ... INFO router.bot: bot online: <봇 이름>#1234
+  ```
+- 사용자는 봇이 떴는지 확인한 뒤 도구에게 "bot online 떴어" 정도만 알려주면 된다.
 
-### 정상 시작 시 보이는 출력
+### 도구가 (자기 Bash 로) 검증
+```bash
+ps aux | grep router.bot | grep -v grep   # 프로세스 존재
+tail -5 bot.log | grep "bot online"        # 로그에 online 라인
 ```
-... INFO router.bot: synced N commands to guild ...
-... INFO router.bot: bot online: <봇 이름>#1234
-```
+둘 다 통과하면 단계 7 OK.
 
 ### 분기
-- `DISCORD_TOKEN is not set` → 단계 5의 .env가 제대로 안 채워짐. 도구가 직접 점검.
-- `LoginFailure` / `Improper token` → 토큰이 틀림. 단계 3-2에서 받은 값 재확인.
+- `LoginFailure` / `Improper token` 가 봇 로그에 뜸 → 토큰 입력 오타. 사용자에게 토큰을 한 번 더 정확히 입력하라고 안내 + 잘못된 항목 삭제 명령 안내:
+  ```bash
+  security delete-generic-password -s kimi-bridge -a discord-token
+  ./run-bot.sh   # 다시 프롬프트 → 새로 입력
+  ```
+- `DISCORD_TOKEN is not set` 가 떴다면 → `run-bot.sh` 가 `security` 명령으로 Keychain 조회에 실패했거나 export 가 안 됨. `security find-generic-password -s kimi-bridge -a discord-token` 이 항목 존재를 보여주는지 확인 (값은 출력하지 말 것).
 - `bot online` 까지 뜨면 OK. 사용자에게 "Discord 서버에 봇이 온라인 상태로 보이는지" 확인 요청.
 
-> 이 단계 이후 봇 프로세스는 **백그라운드에서 계속 돌아야** 한다. 도구는 사용자에게 `nohup .venv/bin/python -m router.bot > bot.log 2>&1 &` 같은 방식으로 백그라운드 실행 옵션을 제시하고, 사용자의 선택대로 진행한다.
+> 백그라운드 운영: 사용자가 봇을 띄운 채로 다른 작업을 계속하려면:
+> ```bash
+> nohup ./run-bot.sh > bot.log 2>&1 &
+> ```
+> Keychain 에 비밀이 이미 등록된 상태라면 프롬프트 없이 silent 시작하므로 nohup 호환됨.
 
 ---
 
@@ -204,12 +228,68 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 ---
 
 ### 완료
-여기까지 통과하면 설치 완료. 사용자에게 다음을 안내한다:
-- 일상 사용: `/new`로 세션 시작 → 스레드에서 대화 → 끝나면 `/kill`
-- 응답이 길어 보이거나 잘못된 방향이면 `/stop`으로 중단
-- 스레드 이름과 cmux 탭 이름 동시 변경: `/rename <새 이름>`
-- 봇을 잠깐 내렸다가 다시 띄울 때: cmux surface 는 살아있으므로 같은 스레드에서 `/attach` 로 재연결
-- 봇을 영구적으로 띄워두려면 `launchd`나 `pm2` 등을 사용한 데몬화를 추가로 안내 (이 문서 범위 밖)
+여기까지 통과하면 설치 완료. 사용자에게 단계 10 (일상 운용) 을 안내한다.
+
+---
+
+## 단계 10 — 일상 운용 (재실행 / 재부팅 / 자동 시작 / 토큰 회전)
+
+| 상황 | 명령 |
+|---|---|
+| 봇이 죽었거나 그냥 다시 띄우기 | `./run-bot.sh` (또는 백그라운드: `nohup ./run-bot.sh > bot.log 2>&1 &`) |
+| Mac 재부팅 후 | cmux 띄우고 (`open -a cmux`) `./run-bot.sh` |
+| 로그인 시 자동 시작 | launchd plist 등록 (아래 참조) |
+| 토큰 갱신 (Discord 또는 Moonshot 한쪽) | `security delete-generic-password -s kimi-bridge -a discord-token` (또는 `-a moonshot-key`) 후 `./run-bot.sh` — 해당 항목만 다시 프롬프트 |
+| 일상 사용 | `/new` → 스레드 대화 → 끝나면 `/kill` |
+| 응답 중단 | `/stop` |
+| 스레드 이름 + cmux 탭 이름 동시 변경 | `/rename <새 이름>` |
+| 봇을 잠깐 내렸다 다시 띄울 때 (세션 복구) | cmux surface 는 살아있으므로 같은 스레드에서 `/attach` |
+
+### launchd 자동 시작 (선택)
+
+`~/Library/LaunchAgents/com.kimi-bridge.plist` 생성:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kimi-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/<클론 경로>/run-bot.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/<클론 경로>/bot.log</string>
+  <key>StandardErrorPath</key>
+  <string>/<클론 경로>/bot.log</string>
+</dict>
+</plist>
+```
+등록:
+```bash
+launchctl load ~/Library/LaunchAgents/com.kimi-bridge.plist
+```
+**주의**: launchd 는 TTY 가 없어 첫 실행 프롬프트를 띄울 수 없다. 반드시 **단계 7 을 적어도 한 번 성공시킨 뒤** (= Keychain 에 비밀이 들어간 뒤) 에만 launchd 등록한다.
+
+### 도구한테 떠넘겨도 되는 작업 / 떠넘기면 안 되는 작업
+
+| 작업 | AI 도구가 해도 OK? |
+|---|---|
+| 봇 restart (`pkill -f router.bot` + `./run-bot.sh &`) | ✓ Keychain 에 이미 있으면 silent |
+| `bot.log` tail / grep | ✓ 토큰은 로그에 안 찍힘 |
+| cmux RPC 호출 (`surface.list` 등) | ✓ |
+| 코드 수정 / 디버깅 | ✓ |
+| `ps eww -p <bot_pid>` | ✗ 봇 env 전체(토큰 포함)가 stdout 으로 노출됨 |
+| `security find-generic-password ... -w` | ✗ Keychain 값을 stdout 으로 끌어냄 |
+| `printenv` / `env` 를 봇 띄운 셸에서 실행 | ✗ 토큰이 export 되어 있을 수 있음 |
+
+위 ✗ 항목들은 [`CLAUDE.md`](../CLAUDE.md) 에 룰로 박혀 있으니 (있는 경우) Claude Code 가 자동으로 회피한다.
 
 ---
 
@@ -217,8 +297,8 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 
 | 변수 | 필수 | 기본값 | 설명 |
 |---|---|---|---|
-| `DISCORD_TOKEN` | ✓ | — | Discord 봇 토큰 |
-| `MOONSHOT_API_KEY` | ✓ | — | kimi-cli 모델 인증 |
+| `DISCORD_TOKEN` | ✓ | — | Discord 봇 토큰. **`.env` 에 적지 않음 — Keychain (service=`kimi-bridge`, account=`discord-token`) 에 저장. `run-bot.sh` 가 export 함.** |
+| `MOONSHOT_API_KEY` | ✓ | — | kimi-cli 모델 인증. **`.env` 에 적지 않음 — Keychain (service=`kimi-bridge`, account=`moonshot-key`) 에 저장. `run-bot.sh` 가 export 함.** |
 | `DISCORD_GUILD_ID` | | — | 설정 시 해당 길드에만 명령을 sync (빠름, 권장) |
 | `DEFAULT_WORK_DIR` | | `$HOME` | 새 워크스페이스의 기본 cwd |
 | `CMUX_CMD` | | `cmux` | cmux 바이너리 경로 (PATH에 없을 때만 절대경로 지정) |
@@ -235,7 +315,13 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 방금 만든 세션이 cmux로 전파되기 전(30초 이내)이면 보호 grace period에 들어가 좀비 판정에서 제외된다. 그래도 false positive가 의심되면 봇 로그의 `cmux preflight failed` 라인을 확인.
 
 **Q. 토큰을 노출했다.**
-즉시 Developer Portal에서 **Reset Token**을 누르고 `.env`를 새 토큰으로 갱신한 뒤 봇 재시작.
+즉시 다음 순서로:
+1. Discord Developer Portal 에서 **Reset Token** (또는 Moonshot 콘솔에서 키 회전).
+2. Keychain 의 이전 항목 삭제:
+   ```bash
+   security delete-generic-password -s kimi-bridge -a discord-token   # 또는 -a moonshot-key
+   ```
+3. `./run-bot.sh` 다시 실행 → 새 토큰 입력 → Keychain 갱신 → 봇 재시작.
 
 **Q. 봇을 재시작했더니 `/attach`가 "연결할 수 있는 kimi surface를 찾지 못했어요"라고 한다 — 분명히 cmux 에 kimi 가 떠 있는데.**
 봇은 종료 시 cmux surface 를 의도적으로 살려두고 registry row 도 `status='active'` 그대로 둔다 (재시작 후 같은 thread 에서 `/attach` 로 재연결할 수 있도록 한 설계). 부작용으로, *다른* 채널에서 `/attach` 를 시도하면 그 surface UUID 가 "이미 등록됨" 으로 판단되어 후보에서 빠진다.

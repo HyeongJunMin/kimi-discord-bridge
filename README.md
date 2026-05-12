@@ -55,6 +55,11 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 수동으로 진행하고 싶다면 같은 문서를 직접 따라 읽어도 됩니다.
 
+### 비밀(토큰/API 키) 관리
+- Discord 봇 토큰과 Moonshot API 키는 **macOS Keychain** 에 저장됩니다. `.env` 에는 비밀이 들어가지 않아 AI 도구가 작업 도중 `.env` 를 읽어도 비밀이 도구 컨텍스트로 흘러들지 않습니다.
+- 봇은 동봉된 `run-bot.sh` 로 실행합니다. 최초 1회만 두 비밀을 프롬프트로 입력받아 Keychain 에 저장하고, 이후엔 silent 시작.
+- 토큰 회전: `security delete-generic-password -s kimi-bridge -a discord-token` 또는 `-a moonshot-key` 후 `./run-bot.sh` 재실행.
+
 ## 트러블슈팅
 
 - `/new`를 눌렀는데 응답이 없음 → 봇 인스턴스가 여러 개 떠 있는지 확인 (같은 토큰 공유 시 interaction 충돌)
