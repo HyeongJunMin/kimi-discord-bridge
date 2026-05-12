@@ -30,6 +30,70 @@ def compute_wire_path(session_uuid: str, cwd: str) -> Path:
     return KIMI_SESSIONS_DIR / h / session_uuid / "wire.jsonl"
 
 
+async def find_live_kimi_surface_ids() -> set[str]:
+    """Return cmux surface UUIDs whose tty is currently owned by a kimi-cli
+    process.
+
+    Cross-reference:
+      1. cmux `system.tree` RPC → per-surface `tty` (e.g. "ttys011")
+      2. `ps -axo tty,command` filtered to kimi-cli (setproctitle: "Kimi Code")
+      3. Intersect on tty.
+
+    A surface in this set is *guaranteed* to be running a live kimi-cli
+    (not just displaying a stale banner from a closed session). This is
+    the strongest liveness signal we have — stronger than wire.jsonl
+    mtime, since kimi closes the file between writes so an idle but
+    live session shows old mtime.
+    """
+    from .cmux_client import system_tree, CmuxError  # local import to avoid cycle
+
+    # Step 1 — kimi-cli ttys from ps
+    proc = await asyncio.create_subprocess_exec(
+        "ps", "-axo", "tty,command",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    kimi_ttys: set[str] = set()
+    for line in out.decode().splitlines():
+        # kimi-cli uses setproctitle("Kimi Code"); be liberal about case
+        # and also accept "kimi-cli" in case proctitle isn't set.
+        if "Kimi Code" not in line and "kimi-cli" not in line.lower():
+            continue
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        tty = parts[0].strip()
+        if not tty or tty == "??" or tty == "TTY":
+            continue
+        # ps prints "ttys011"; cmux reports the same. Normalize: strip any
+        # leading "/dev/" just in case.
+        kimi_ttys.add(tty.removeprefix("/dev/"))
+    if not kimi_ttys:
+        return set()
+
+    # Step 2 — cmux tree → surface uuid → tty
+    try:
+        tree = await system_tree()
+    except CmuxError:
+        return set()
+
+    live: set[str] = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("type") == "terminal" and o.get("tty") and o.get("id"):
+                if o["tty"] in kimi_ttys:
+                    live.add(o["id"])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(tree)
+    return live
+
+
 async def wait_for_wire_jsonl(session_uuid: str, cwd: str, max_wait: float = 60.0) -> Path | None:
     wire_path = compute_wire_path(session_uuid, cwd)
     log.info("wait_for_wire_jsonl: cwd=%r hash=%s expected=%s", cwd, work_dir_hash(cwd), wire_path)

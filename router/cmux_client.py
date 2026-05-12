@@ -32,6 +32,17 @@ async def _rpc(method: str, params: dict | None = None) -> Any:
         return out_s  # some methods return plain text
 
 
+async def system_tree() -> dict:
+    """Full window/workspace/pane/surface tree, with per-surface `tty` field.
+
+    Used to map cmux surfaces → tty so we can cross-reference against `ps`
+    output and prove which surfaces are actually running a live kimi-cli
+    process (rather than just displaying its leftover banner).
+    """
+    res = await _rpc("system.tree")
+    return res or {}
+
+
 async def list_workspaces() -> list[dict]:
     """Returns list of workspace dicts (subset of fields used)."""
     res = await _rpc("workspace.list")
@@ -79,9 +90,19 @@ async def surface_send_text(surface_id: str, text: str) -> dict | None:
     return await _rpc("surface.send_text", {"surface_id": surface_id, "text": text})
 
 
-async def surface_read_text(surface_id: str) -> str | None:
-    """Read plain-text content of a cmux terminal surface (ANSI stripped)."""
-    res = await _rpc("surface.read_text", {"surface_id": surface_id})
+async def surface_read_text(surface_id: str, *,
+                              scrollback: bool = False) -> str | None:
+    """Read plain-text content of a cmux terminal surface (ANSI stripped).
+
+    By default returns only the current visible viewport. Pass
+    scrollback=True to include the full scrollback history — needed when
+    something we're looking for (e.g. the kimi-cli session banner used by
+    /attach) may have scrolled off-screen in a long-running surface.
+    """
+    params: dict = {"surface_id": surface_id}
+    if scrollback:
+        params["scrollback"] = True
+    res = await _rpc("surface.read_text", params)
     if isinstance(res, str):
         return res
     if isinstance(res, dict):

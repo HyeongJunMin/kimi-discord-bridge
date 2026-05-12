@@ -23,7 +23,10 @@ from .cmux_client import (list_workspaces, create_workspace, create_surface,
                           CmuxError, list_surfaces, ensure_cmux_running,
                           rename_tab)
 from .registry import Registry, SessionRow
-from .discord_relay import ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl
+from .discord_relay import (
+    ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl,
+    find_live_kimi_surface_ids,
+)
 
 log = logging.getLogger("router.bot")
 logging.basicConfig(level=logging.INFO,
@@ -719,32 +722,58 @@ async def attach_cmd(interaction: discord.Interaction):
         r.monitor_surface_id for r in router.registry.list_active()
         if r.monitor_surface_id
     }
+    # Process-level ground truth: a surface is only a real kimi candidate
+    # if its tty is currently owned by a kimi-cli process. We get this by
+    # joining cmux's system.tree (surface → tty) with `ps` output (kimi-cli
+    # → tty). Anything else (closed kimi, Claude scrollback containing a
+    # UUID-shaped string, stale banner left by a crashed session) is rejected.
+    live_kimi_surfaces = await find_live_kimi_surface_ids()
+    log.info("/attach: %d surface(s) currently running kimi-cli: %s",
+             len(live_kimi_surfaces), live_kimi_surfaces)
 
+    log.info("/attach: scanning %d workspace(s), registered=%s",
+             len(wss), registered_surface_ids)
     for ws in wss:
         ws_id = ws.get("id") or ws.get("ref")
         if not ws_id:
             continue
         try:
             surfaces = await list_surfaces(ws_id)
-        except CmuxError:
+        except CmuxError as e:
+            log.info("/attach: list_surfaces(%s) failed: %s", ws_id, e)
             continue
+        log.info("/attach: ws=%s has %d surface(s)", ws.get("title") or ws_id, len(surfaces))
         for surf in surfaces:
             surf_id = surf.get("id") or surf.get("surface_id") or surf.get("ref")
+            log.info("/attach:   surf id=%s title=%r", surf_id, surf.get("title"))
             if not surf_id:
                 continue
             if surf_id in registered_surface_ids:
+                log.info("/attach:     skip (already registered)")
                 continue  # already attached
-            # Quick check: read text and look for session UUID
+            if surf_id not in live_kimi_surfaces:
+                log.info("/attach:     skip (not in live_kimi_surfaces)")
+                continue  # tty not owned by a kimi-cli process — skip
+            # Read with scrollback so the kimi banner ("Session: <uuid>",
+            # "Directory: ...") is still findable on surfaces that have been
+            # running long enough for the welcome screen to scroll off the
+            # visible viewport. False-positives are impossible here because
+            # the tty/proc check above already proved kimi-cli is alive.
             try:
-                text = await surface_read_text(surf_id)
-            except CmuxError:
+                text = await surface_read_text(surf_id, scrollback=True)
+            except CmuxError as e:
+                log.info("/attach:     skip (read_text err: %s)", e)
                 continue
             if not text:
+                log.info("/attach:     skip (empty text)")
                 continue
-            m = SESSION_RE.search(text)
-            if not m:
+            # Take the *last* UUID match — if the same surface restarted
+            # kimi, the most recent banner is what's currently running.
+            matches = SESSION_RE.findall(text)
+            log.info("/attach:     text len=%d session matches=%s", len(text), matches)
+            if not matches:
                 continue
-            session_uuid = m.group(1)
+            session_uuid = matches[-1]
 
             # Banner's "Directory:" line is the authoritative cwd source.
             # cmux's requested_working_directory is often None for surfaces
