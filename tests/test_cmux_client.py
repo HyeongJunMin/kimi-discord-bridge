@@ -196,6 +196,25 @@ async def test_surface_read_text_handles_dict_text_key(monkeypatch):
     assert out == "from-key"
 
 
+async def test_surface_read_text_default_omits_scrollback_param(monkeypatch):
+    """Default call must not include the scrollback flag (visible viewport only)."""
+    mock_rpc = AsyncMock(return_value="text")
+    monkeypatch.setattr(cmux_client, "_rpc", mock_rpc)
+    await cmux_client.surface_read_text("surf-1")
+    params = mock_rpc.await_args.args[1]
+    assert "scrollback" not in params
+
+
+async def test_surface_read_text_with_scrollback_sets_param(monkeypatch):
+    """scrollback=True must propagate so /attach can find banners that
+    have scrolled off the visible viewport."""
+    mock_rpc = AsyncMock(return_value="text")
+    monkeypatch.setattr(cmux_client, "_rpc", mock_rpc)
+    await cmux_client.surface_read_text("surf-1", scrollback=True)
+    params = mock_rpc.await_args.args[1]
+    assert params.get("scrollback") is True
+
+
 async def test_close_surface_passes_id(monkeypatch):
     mock_rpc = AsyncMock(return_value=None)
     monkeypatch.setattr(cmux_client, "_rpc", mock_rpc)

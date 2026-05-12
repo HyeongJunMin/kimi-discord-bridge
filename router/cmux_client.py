@@ -79,9 +79,19 @@ async def surface_send_text(surface_id: str, text: str) -> dict | None:
     return await _rpc("surface.send_text", {"surface_id": surface_id, "text": text})
 
 
-async def surface_read_text(surface_id: str) -> str | None:
-    """Read plain-text content of a cmux terminal surface (ANSI stripped)."""
-    res = await _rpc("surface.read_text", {"surface_id": surface_id})
+async def surface_read_text(surface_id: str, *,
+                              scrollback: bool = False) -> str | None:
+    """Read plain-text content of a cmux terminal surface (ANSI stripped).
+
+    By default returns only the current visible viewport. Pass
+    scrollback=True to include the full scrollback history — needed when
+    something we're looking for (e.g. the kimi-cli session banner used by
+    /attach) may have scrolled off-screen in a long-running surface.
+    """
+    params: dict = {"surface_id": surface_id}
+    if scrollback:
+        params["scrollback"] = True
+    res = await _rpc("surface.read_text", params)
     if isinstance(res, str):
         return res
     if isinstance(res, dict):

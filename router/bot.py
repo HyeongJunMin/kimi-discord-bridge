@@ -734,9 +734,12 @@ async def attach_cmd(interaction: discord.Interaction):
                 continue
             if surf_id in registered_surface_ids:
                 continue  # already attached
-            # Quick check: read text and look for session UUID
+            # Read with scrollback so the kimi banner ("Session: <uuid>",
+            # "Directory: ...") is still findable on surfaces that have been
+            # running long enough for the welcome screen to scroll off the
+            # visible viewport.
             try:
-                text = await surface_read_text(surf_id)
+                text = await surface_read_text(surf_id, scrollback=True)
             except CmuxError:
                 continue
             if not text:
