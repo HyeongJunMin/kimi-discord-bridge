@@ -233,7 +233,8 @@ async def new_session_cmd(interaction: discord.Interaction):
                          if surface else " · (cmux surface 생성 실패)")
             await thread.send(
                 f"준비 완료. session=`{sess.session_uuid[:8]}…`{surf_line}\n"
-                f"메시지를 보내면 kimi에 전달됩니다.")
+                f"메시지를 보내면 kimi에 전달됩니다.\n"
+                f"이 스레드에서: `/stop` 응답 멈춤 · `/kill` 세션 종료")
         except Exception as e:
             log.exception("session start failed")
             await thread.send(f"⚠️ 세션 시작 실패: `{e}`")
@@ -337,6 +338,34 @@ async def status_cmd(interaction: discord.Interaction):
         f"```"
     )
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(name="stop", description="진행 중인 kimi 응답을 멈춥니다 (ESC 전송)")
+async def stop_cmd(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message("thread에서만 사용 가능해요.", ephemeral=True)
+        return
+    row = router.registry.get_by_thread(str(interaction.channel.id))
+    if not row or row.status != "active":
+        await interaction.response.send_message("활성 세션이 없어요.", ephemeral=True)
+        return
+    if str(interaction.user.id) != row.owner_user_id:
+        await interaction.response.send_message("세션 소유자만 사용할 수 있어요.", ephemeral=True)
+        return
+    sess = router.sessions.get(interaction.channel.id)
+    if not sess:
+        await interaction.response.send_message("세션 객체를 찾을 수 없어요.", ephemeral=True)
+        return
+    # Send raw ESC (no newline) directly to the surface. Bypassing
+    # send_to_surface keeps us from appending '\n' (which would commit a
+    # blank line instead of cancelling) and from triggering the tail-start
+    # path (already started by the time user can /stop).
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await surface_send_text(sess.surface_id, "\x1b")
+        await interaction.followup.send("⏹ ESC 전송 완료", ephemeral=True)
+    except CmuxError as e:
+        await interaction.followup.send(f"⚠️ ESC 전송 실패: {e}", ephemeral=True)
 
 
 @tree.command(name="clear", description="kimi 컨텍스트를 리셋합니다 (/clear)")
@@ -548,7 +577,8 @@ async def attach_cmd(interaction: discord.Interaction):
 
         await thread.send(
             f"준비 완료. 메시지를 보내면 kimi에 전달됩니다.\n"
-            f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"
+            f"session=`{session_uuid[:8]}…` · surface `{surf_id}`\n"
+            f"이 스레드에서: `/stop` 응답 멈춤 · `/kill` 세션 종료"
         )
         log.info("attach: session %s attached to thread %s", session_uuid, thread.id)
 
