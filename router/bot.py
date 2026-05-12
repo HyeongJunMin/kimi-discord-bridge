@@ -247,20 +247,76 @@ async def new_session_cmd(interaction: discord.Interaction):
 
 # ── Additional slash commands ─────────────────────────────────────────────────
 
+async def _kill_session_and_thread(thread: discord.Thread,
+                                    surface_id: str | None) -> tuple[str, str]:
+    """Shutdown the session, verify cmux surface closed, then delete the
+    Discord thread. Returns (status_line, thread_name_for_log).
+
+    - surface verification: a successful surface.read_text after close means
+      the surface is still alive (close failed). CmuxError = surface gone =
+      expected.
+    - thread.delete failure is logged but doesn't abort — we still want the
+      parent-channel log to fire so the user sees something happened.
+    """
+    thread_name = thread.name
+    # shutdown_session is idempotent: pops from in-memory sessions if present,
+    # marks registry row 'dead' if exists, otherwise no-op. Safe for orphan
+    # threads with no active session.
+    await router.shutdown_session(thread.id)
+
+    parts: list[str] = []
+    if surface_id:
+        try:
+            await surface_read_text(surface_id)
+            parts.append("surface ⚠️ 닫기 실패")
+        except CmuxError:
+            parts.append("surface ✓")
+
+    thread_ok = True
+    try:
+        await thread.delete()
+    except Exception as e:
+        thread_ok = False
+        log.warning("thread.delete failed for %s: %s", thread.id, e)
+    parts.append("thread 삭제 ✓" if thread_ok else "thread 삭제 ⚠️ 실패")
+
+    return " · ".join(parts), thread_name
+
+
 @tree.command(name="kill", description="세션을 종료합니다 (thread 내/외 모두 사용 가능)")
 async def kill_cmd(interaction: discord.Interaction):
-    # Case 1: used inside a thread → kill this thread's session
+    # Case 1: used inside a thread → kill this thread's session OR clean up
+    # an orphan/dead thread.
     if isinstance(interaction.channel, discord.Thread):
-        row = router.registry.get_by_thread(str(interaction.channel.id))
-        if not row or row.status != "active":
-            await interaction.response.send_message("활성 세션이 없어요.", ephemeral=True)
+        thread = interaction.channel
+        row = router.registry.get_by_thread(str(thread.id))
+        is_active = bool(row and row.status == "active")
+        # Owner check: enforced if registry row exists. True orphans (no row)
+        # have no recorded owner — anyone in the thread can clean them up.
+        if row and str(interaction.user.id) != row.owner_user_id:
+            verb = "종료" if is_active else "정리"
+            await interaction.response.send_message(
+                f"세션 소유자만 {verb}할 수 있어요.", ephemeral=True)
             return
-        if str(interaction.user.id) != row.owner_user_id:
-            await interaction.response.send_message("세션 소유자만 종료할 수 있어요.", ephemeral=True)
-            return
-        await interaction.response.send_message("🛑 세션 종료 중...", ephemeral=True)
-        await router.shutdown_session(interaction.channel.id)
-        await interaction.channel.send("✓ 세션이 종료되었습니다.")
+        # Defer so we have headroom for cmux close + verify + thread.delete.
+        await interaction.response.defer(ephemeral=True)
+        parent = thread.parent
+        # surface_id only set for active sessions — orphan/dead threads
+        # don't need surface verification (already gone).
+        surface_id = row.monitor_surface_id if is_active else None
+        status, name = await _kill_session_and_thread(thread, surface_id)
+        # Ephemeral feedback: this lands in the thread but the thread is now
+        # gone — the caller sees it for a brief moment in their client cache.
+        try:
+            await interaction.followup.send(f"🛑 종료 완료 — {status}", ephemeral=True)
+        except Exception:
+            pass
+        # Persistent log in the parent channel.
+        if isinstance(parent, discord.TextChannel):
+            try:
+                await parent.send(f"🛑 `{name}` 종료 — {status}")
+            except Exception as e:
+                log.warning("parent log send failed: %s", e)
         return
 
     # Case 2: used outside a thread → show dropdown of active sessions
@@ -271,9 +327,11 @@ async def kill_cmd(interaction: discord.Interaction):
         return
 
     options = []
+    _surface_map: dict[str, str | None] = {}
     for r in owner_sessions[:25]:
         thread = client.get_channel(int(r.thread_id))
         label = (thread.name if thread else f"thread:{r.thread_id}")[:100]
+        _surface_map[r.thread_id] = r.monitor_surface_id
         options.append(discord.SelectOption(
             label=label,
             value=r.thread_id,
@@ -282,15 +340,22 @@ async def kill_cmd(interaction: discord.Interaction):
     select = discord.ui.Select(placeholder="종료할 세션 선택", options=options)
 
     async def on_select(inter: discord.Interaction):
-        # shutdown_session calls cmux surface.close + sqlite update;
-        # ~1-2s typical. Defer to avoid the 3s interaction deadline.
+        # shutdown_session + verify + thread.delete: ~2-4s total. Defer.
         await inter.response.defer(ephemeral=True)
-        thread_id = int(select.values[0])
-        thread = client.get_channel(thread_id)
-        await router.shutdown_session(thread_id)
-        if thread:
-            await thread.send("✓ 이 세션이 종료되었습니다.")
-        await inter.followup.send("🛑 세션 종료 완료", ephemeral=True)
+        thread_id_str = select.values[0]
+        thread = client.get_channel(int(thread_id_str))
+        if not isinstance(thread, discord.Thread):
+            await inter.followup.send("thread 객체를 찾을 수 없어요.", ephemeral=True)
+            return
+        parent = thread.parent
+        status, name = await _kill_session_and_thread(
+            thread, _surface_map.get(thread_id_str))
+        await inter.followup.send(f"🛑 `{name}` 종료 — {status}", ephemeral=True)
+        if isinstance(parent, discord.TextChannel):
+            try:
+                await parent.send(f"🛑 `{name}` 종료 — {status}")
+            except Exception as e:
+                log.warning("parent log send failed: %s", e)
 
     select.callback = on_select
     view = discord.ui.View(timeout=120)
