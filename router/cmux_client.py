@@ -91,3 +91,41 @@ async def surface_read_text(surface_id: str) -> str | None:
 
 async def close_surface(surface_id: str) -> None:
     await _rpc("surface.close", {"surface_id": surface_id})
+
+
+async def ensure_cmux_running(timeout: float = 15.0) -> bool:
+    """Launch the cmux app if its RPC socket isn't responding.
+
+    Returns True if cmux is up (already was, or came up within timeout).
+    Returns False if `open -a cmux` failed (likely not installed) or the
+    daemon never came online. macOS-only; on other OSes the `open` call
+    will fail soft.
+    """
+    import asyncio, time
+    try:
+        await _rpc("workspace.list")
+        return True
+    except CmuxError:
+        pass
+    log.info("cmux not responding; launching via `open -a cmux`")
+    proc = await asyncio.create_subprocess_exec(
+        "open", "-a", "cmux",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        log.error("`open -a cmux` failed (rc=%d): %s", proc.returncode,
+                  err.decode().strip())
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(1.0)
+        try:
+            await _rpc("workspace.list")
+            log.info("cmux online")
+            return True
+        except CmuxError:
+            continue
+    log.error("cmux failed to come up within %.1fs", timeout)
+    return False

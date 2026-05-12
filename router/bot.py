@@ -20,7 +20,7 @@ from discord import app_commands
 
 from .cmux_client import (list_workspaces, create_workspace, create_surface,
                           surface_send_text, surface_read_text, close_surface,
-                          CmuxError, list_surfaces)
+                          CmuxError, list_surfaces, ensure_cmux_running)
 from .registry import Registry, SessionRow
 from .discord_relay import ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl
 
@@ -696,6 +696,28 @@ async def cleanup_cmd(interaction: discord.Interaction):
         summary += "\n⚠️ cmux 응답 없음 — 좀비 탐지는 건너뜀."
     await interaction.followup.send(summary + " 삭제할 thread를 선택하세요:",
                                      view=view, ephemeral=True)
+
+
+@tree.command(name="cmux-run", description="cmux 데몬이 꺼져 있으면 실행시킵니다")
+async def cmux_run_cmd(interaction: discord.Interaction):
+    # ensure_cmux_running can take up to 15s; defer first.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await list_workspaces()
+        await interaction.followup.send(
+            "✓ cmux는 이미 실행 중입니다.", ephemeral=True)
+        return
+    except CmuxError:
+        pass
+    ok = await ensure_cmux_running()
+    if ok:
+        await interaction.followup.send(
+            "🚀 cmux를 실행했습니다.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "⚠️ cmux 실행 실패. `/Applications/cmux.app` 설치 여부 확인 "
+            "(macOS 전용). 자세한 사유는 봇 로그 참조.",
+            ephemeral=True)
 
 
 @tree.command(name="rebind", description="현재 세션을 새 Discord thread로 옮깁니다")

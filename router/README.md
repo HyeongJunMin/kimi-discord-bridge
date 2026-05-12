@@ -13,14 +13,31 @@ so authentication uses `MOONSHOT_API_KEY` only.
 - `discord_relay.py`  — per-thread debounce + edit-roll-over output
 - `bot.py`            — entry point: `/new`, message routing, permission buttons
 
+## Prerequisites
+- **cmux.app** (macOS) — `/Applications/cmux.app` 설치 필요. 봇은 cmux의 Unix
+  socket RPC(`cmux rpc workspace.list` 등)에 의존합니다. 데몬이 꺼져 있으면
+  Discord에서 `/cmux-run` 슬래시 커맨드로 실행 가능 (`open -a cmux` 호출).
+- **kimi-cli** — `MOONSHOT_API_KEY`로 인증.
+
 ## Run
 ```sh
-pip install discord.py
+pip install discord.py python-dotenv
 export DISCORD_BOT_TOKEN=...
 export MOONSHOT_API_KEY=sk-...   # kimi-cli reads this for model auth
 export GUILD_ID=...              # optional: guild-only sync (faster)
 python -m router.bot
 ```
+
+## Slash commands
+- `/new`           새 kimi 세션 + Discord thread 생성
+- `/kill`          세션 종료 (thread 내부/외부 모두)
+- `/list`          내 활성 세션 목록
+- `/status`        현재 thread 세션 상세
+- `/clear`,`/yolo`,`/model`  kimi-cli 측에 단축 명령 전달
+- `/attach`        기존 cmux surface에 연결
+- `/cleanup`       고아 thread(미등록 또는 좀비 세션) 일괄 삭제
+- `/rebind`        현재 세션을 새 thread로 이전
+- `/cmux-run`      cmux 데몬이 꺼져 있으면 실행
 
 ## Out-of-scope (deferred)
 - Multi-user ACL beyond owner-only
