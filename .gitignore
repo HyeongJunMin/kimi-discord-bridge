@@ -7,4 +7,7 @@ __pycache__/
 venv/
 .DS_Store
 *.txt
+!requirements*.txt
 *.json
+.coverage
+bot.log
