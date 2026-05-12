@@ -30,7 +30,7 @@ def compute_wire_path(session_uuid: str, cwd: str) -> Path:
     return KIMI_SESSIONS_DIR / h / session_uuid / "wire.jsonl"
 
 
-async def wait_for_wire_jsonl(session_uuid: str, cwd: str, max_wait: float = 30.0) -> Path | None:
+async def wait_for_wire_jsonl(session_uuid: str, cwd: str, max_wait: float = 60.0) -> Path | None:
     wire_path = compute_wire_path(session_uuid, cwd)
     log.info("wait_for_wire_jsonl: cwd=%r hash=%s expected=%s", cwd, work_dir_hash(cwd), wire_path)
     deadline = time.time() + max_wait
@@ -71,8 +71,13 @@ class ThreadRelay:
         self._flush_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-    async def start_tail(self, wire_path: Path, client: "discord.Client") -> None:
-        """Start tailing wire.jsonl. Call after the first turn has begun."""
+    async def start_tail(self, wire_path: Path, client: "discord.Client",
+                         *, from_beginning: bool = False) -> None:
+        """Start tailing wire.jsonl. Call after the first turn has begun.
+
+        from_beginning=True is used on the very first tail start so we can
+        replay events kimi-cli wrote while we were waiting for the file.
+        """
         if self._tail_started:
             return
         self._tail_started = True
@@ -103,19 +108,21 @@ class ThreadRelay:
                 await self._send_now(f"{icon} `{payload.get('id', 'tool')}`")
 
         self.tail.on_event(on_event)
-        await self.tail.start(from_beginning=False)
-        log.info("tail started for thread %s", self.thread.id)
+        await self.tail.start(from_beginning=from_beginning)
+        log.info("tail started for thread %s (from_beginning=%s)",
+                 self.thread.id, from_beginning)
 
-    async def ensure_tail(self, session_uuid: str, cwd: str, client: "discord.Client") -> bool:
+    async def ensure_tail(self, session_uuid: str, cwd: str, client: "discord.Client",
+                          *, from_beginning: bool = False) -> bool:
         """Lazy-start tail when wire.jsonl becomes available."""
         if self._tail_started:
             return True
-        wire_path = await wait_for_wire_jsonl(session_uuid, cwd, max_wait=30.0)
+        wire_path = await wait_for_wire_jsonl(session_uuid, cwd, max_wait=60.0)
         if not wire_path:
             log.error("wire.jsonl not found for session %s", session_uuid)
             await self.thread.send("⚠️ wire.jsonl 찾기 실패 — 응답을 수신할 수 없습니다.")
             return False
-        await self.start_tail(wire_path, client)
+        await self.start_tail(wire_path, client, from_beginning=from_beginning)
         return True
 
     # ── streaming text: debounce + roll-over edit ─────────────────────────────

@@ -51,10 +51,17 @@ class WireSession:
         return self.relay
 
     async def send_to_surface(self, text: str, client: discord.Client):
-        # Ensure relay tail is running before sending
-        if self.relay and not self.relay._tail_started:
-            await self.relay.ensure_tail(self.session_uuid, self.cwd, client)
+        # wire.jsonl is created lazily by kimi-cli on the first conversation
+        # turn — i.e. only AFTER we send the first user message. So the order
+        # must be: send first, then wait for the file. Reversing this caused
+        # a 60s timeout on the first user message and silently lost replies.
         await surface_send_text(self.surface_id, text + "\n")
+        if self.relay and not self.relay._tail_started:
+            # First tail start: read from beginning so we don't miss the
+            # response that kimi is already streaming for the message we
+            # just sent.
+            await self.relay.ensure_tail(self.session_uuid, self.cwd, client,
+                                         from_beginning=True)
         if self.relay:
             self.relay.reset_message_anchor()
 
