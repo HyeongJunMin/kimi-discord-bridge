@@ -16,21 +16,31 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 ## 주요 기능
 
-| 슬래시 명령 | 설명 |
+### 슬래시 명령
+
+| 명령 | 설명 |
 |---|---|
 | `/new` | 새 kimi 세션 + 전용 스레드 생성 |
-| `/kill` | 세션 종료 + 스레드 자동 삭제 |
+| `/kill` | 세션 종료. 스레드 안에서 호출 시 해당 스레드 삭제, 텍스트 채널 안에서 호출 시 종료할 스레드를 선택 |
 | `/stop` | 진행 중인 kimi 응답 중단 (ESC 전송) |
+| `/rename <new_name>` | 현재 스레드 이름과 cmux 탭 이름을 동시에 변경 |
 | `/clear` `/yolo` `/model` | kimi-cli에 단축 명령 전달 |
-| `/list` `/status` | 활성 세션 조회 |
-| `/attach` | 이미 떠 있는 cmux surface에 사후 연결 |
+| `/list` `/status` | 활성 세션 조회 (전체 / 현재 스레드) |
+| `/attach` | 이미 떠 있는 cmux surface에 사후 연결. 봇 재시작 후 세션 복구에도 사용. tty + 프로세스 매칭으로 진짜 살아있는 kimi-cli만 후보로 산출 |
 | `/cleanup` | 고아 스레드 + 좀비 세션 일괄 정리 |
 | `/cmux-run` | cmux 데몬이 꺼져있으면 실행 |
 | `/rebind` | 현재 세션을 새 스레드로 이전 |
 
+### 자동 동작
+
+- **이미지 첨부 자동 전달** — 스레드에 png/jpg/jpeg/webp/gif 이미지를 올리면 봇이 `/tmp/kimi-uploads/<thread_id>/` 에 저장한 뒤 `@<absolute path>` 형태로 메시지에 끼워 kimi에 전달. 한 장당 10 MiB 상한. 세션 종료 시 디렉터리 정리.
+- **cmux 탭 이름 자동 설정** — `/new`, `/attach`, `/rebind` 시 cmux surface 탭이 `<workspace 앞 3글자>-<thread 끝 4자리>` 형식으로 자동 명명. 여러 세션이 떠있을 때 PC 화면에서 식별 용이.
+- **스레드 자동 보관 대응** — Discord가 스레드를 자동으로 archive하면 세션이 종료되고 cmux surface도 정리됨. 보관 해제 시 봇이 복구 방법(`/attach` 또는 `/new`)을 안내.
+- **봇 재시작 시 세션 보존** — 봇이 종료되어도 cmux surface는 살려둠. 재시작 후 동일 스레드에서 `/attach`로 재연결 가능.
+
 ## 사전 요구사항
 
-- **macOS** (cmux가 Mac 전용 앱입니다)
+- **macOS** (최근 버전, cmux가 Mac 전용 앱입니다)
 - **Python 3.10 이상**
 - **[cmux.app](https://cmux.io/)** — `/Applications/cmux.app`에 설치되어 있어야 함
 - **[kimi-cli](https://github.com/MoonshotAI/kimi-cli)** — `kimi` 명령이 PATH에 있어야 함
@@ -50,6 +60,8 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 - `/new`를 눌렀는데 응답이 없음 → 봇 인스턴스가 여러 개 떠 있는지 확인 (같은 토큰 공유 시 interaction 충돌)
 - `cmux 호출 실패` → cmux.app이 떠 있지 않음. Discord에서 `/cmux-run` 호출 또는 직접 cmux.app 실행
 - 첫 메시지 응답이 안 옴 → 봇이 wire.jsonl을 못 찾는 상황. 60초 기다리면 에러 메시지가 뜨고, 두 번째 메시지부터 정상화됨 (한 번 보낸 첫 메시지는 cmux 화면에서 확인 가능)
+- `/attach`가 "연결할 수 있는 kimi surface를 찾지 못했어요"라고 응답 (분명히 surface가 떠 있는데) → 봇 재시작 직후 흔한 케이스. registry에 `status='active'`인 좀비 row가 남아있어 후보에서 제외됨. 같은 스레드에서 다시 `/attach`로 재연결되거나, 텍스트 채널에서 `/cleanup`으로 좀비 정리.
+- 이미지 첨부를 올렸는데 kimi가 못 읽음 → 봇 로그의 `rejection` 라인 확인. 확장자(`.png/.jpg/.jpeg/.webp/.gif`)와 10 MiB 상한 체크.
 
 ## 개발자용 문서
 

@@ -81,6 +81,7 @@ pip install -r requirements.txt
 4. 좌측 **OAuth2 → URL Generator** →
    - Scopes: `bot`, `applications.commands` 둘 다 체크
    - Bot Permissions:
+     - View Channels
      - Send Messages
      - Send Messages in Threads
      - Create Public Threads
@@ -183,10 +184,31 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 - `cmux 호출 실패` → 단계 6 다시.
 - `워크스페이스 선택`이 안 뜨고 에러 → 봇 로그 확인.
 
+---
+
+## 단계 9 — 이미지 첨부 검증 (선택)
+
+> 텍스트 외에 이미지를 kimi 에 보낼 수 있는지 한 번 확인하는 단계. 평소 자주 쓰는 기능이라면 이 단계도 거치는 게 좋다.
+
+### 사용자에게 안내
+1. 단계 8 에서 만든 스레드에 png 또는 jpg 이미지 한 장을 드래그해 업로드.
+2. 메시지 본문은 비워도 되고 "이거 뭐야?" 같은 한 줄을 같이 보내도 됨.
+3. 봇이 이미지를 `/tmp/kimi-uploads/<thread_id>/` 에 저장하고 `@<abspath>` 형태로 kimi 에 전달.
+4. kimi 가 이미지를 해석한 응답을 스레드에 스트리밍.
+
+### 검증
+- 허용 확장자: `.png .jpg .jpeg .webp .gif`. 그 외는 `⚠️ 일부 첨부를 건너뛰었어요` 메시지로 거부됨.
+- 한 장당 10 MiB 초과 시 거부.
+- 봇 로그에 `attachment download failed` / `attachment save failed` 가 뜨면 디스크 권한, `/tmp` 용량 확인.
+
+---
+
 ### 완료
-이 단계까지 통과하면 설치 완료. 사용자에게 다음을 안내한다:
+여기까지 통과하면 설치 완료. 사용자에게 다음을 안내한다:
 - 일상 사용: `/new`로 세션 시작 → 스레드에서 대화 → 끝나면 `/kill`
 - 응답이 길어 보이거나 잘못된 방향이면 `/stop`으로 중단
+- 스레드 이름과 cmux 탭 이름 동시 변경: `/rename <새 이름>`
+- 봇을 잠깐 내렸다가 다시 띄울 때: cmux surface 는 살아있으므로 같은 스레드에서 `/attach` 로 재연결
 - 봇을 영구적으로 띄워두려면 `launchd`나 `pm2` 등을 사용한 데몬화를 추가로 안내 (이 문서 범위 밖)
 
 ---
@@ -214,3 +236,18 @@ grep -E '^DISCORD_TOKEN=.+' .env >/dev/null && echo OK
 
 **Q. 토큰을 노출했다.**
 즉시 Developer Portal에서 **Reset Token**을 누르고 `.env`를 새 토큰으로 갱신한 뒤 봇 재시작.
+
+**Q. 봇을 재시작했더니 `/attach`가 "연결할 수 있는 kimi surface를 찾지 못했어요"라고 한다 — 분명히 cmux 에 kimi 가 떠 있는데.**
+봇은 종료 시 cmux surface 를 의도적으로 살려두고 registry row 도 `status='active'` 그대로 둔다 (재시작 후 같은 thread 에서 `/attach` 로 재연결할 수 있도록 한 설계). 부작용으로, *다른* 채널에서 `/attach` 를 시도하면 그 surface UUID 가 "이미 등록됨" 으로 판단되어 후보에서 빠진다.
+
+해결 순서:
+1. 가장 깔끔한 길 — 원래 그 세션이 쓰던 thread 안으로 들어가 `/attach` (zombie row 가 정상 row 로 복구됨).
+2. 그 thread 를 못 찾거나 이미 지웠다면 텍스트 채널에서 `/cleanup` 으로 zombie row 정리 후 다시 `/attach`.
+3. 위 두 가지가 다 막혔다면 (긴급) SQLite 직접 수정:
+   ```bash
+   sqlite3 "$SESSION_DB_PATH" "UPDATE sessions SET status='dead' WHERE monitor_surface_id='<UUID>'"
+   ```
+   `<UUID>` 는 봇 로그 `/attach: scanning ... registered={...}` 라인에서 확인.
+
+**Q. `.env.example` 의 `KIMI_CMD`, `DISCORD_CLIENT_ID` 는 뭐냐.**
+주석으로 비활성화되어 있다 (코드가 직접 읽지 않음). `KIMI_CMD` 는 향후 kimi 바이너리 경로를 환경별로 분리하고 싶을 때를 위한 자리, `DISCORD_CLIENT_ID` 는 단계 3 의 OAuth2 URL 을 직접 만들고 싶을 때 참고용이다. 봇 동작에는 영향이 없다.

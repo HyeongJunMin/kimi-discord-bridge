@@ -31,20 +31,26 @@ python -m router.bot
 ## Slash commands
 - `/new`           새 kimi 세션 + Discord thread 생성
 - `/kill`          세션 종료 (thread 내부/외부 모두)
+- `/stop`          진행 중인 kimi 응답 중단 (ESC 전송)
+- `/rename`        현재 thread 이름 + cmux 탭 이름 동시 변경
 - `/list`          내 활성 세션 목록
 - `/status`        현재 thread 세션 상세
 - `/clear`,`/yolo`,`/model`  kimi-cli 측에 단축 명령 전달
-- `/attach`        기존 cmux surface에 연결
+- `/attach`        기존 cmux surface에 연결 (tty + 프로세스 매칭으로 살아있는 kimi-cli만 후보로)
 - `/cleanup`       고아 thread(미등록 또는 좀비 세션) 일괄 삭제
 - `/rebind`        현재 세션을 새 thread로 이전
 - `/cmux-run`      cmux 데몬이 꺼져 있으면 실행
 
+## Implemented since initial MVP
+- 이미지 첨부 자동 전달 (`png/jpg/jpeg/webp/gif`, 한 장 ≤10 MiB → `@<abspath>` 로 kimi 에 패스)
+- 봇 종료 시 cmux surface 보존 + 재시작 후 `/attach` 로 재연결 (restart recovery)
+- /yolo 슬래시 명령 (availableCommands 발견 없이 직접 ESC seq 전송)
+- cmux 탭 이름 자동 명명 (`<workspace[:3]>-<thread_id 끝 4자리>`)
+
 ## Out-of-scope (deferred)
 - Multi-user ACL beyond owner-only
-- Restart recovery (re-attach to live ACP processes by PID)
 - Monitor surface in cmux (read-only viewer)
-- File attachment forwarding (image input via promptCapabilities.image)
-- /yolo, /afk, /compact slash commands surfaced from availableCommands
+- /afk, /compact slash commands surfaced from availableCommands
 - ACP `session/load` to resume a saved session
 
 ## Known caveats observed during probe
