@@ -83,34 +83,37 @@ class ThreadRelay:
         self._tail_started = True
 
         self.tail = WireTail(wire_path)
-
-        async def on_event(ev: dict):
-            msg = ev.get("message", ev)
-            ev_type = msg.get("type", "unknown")
-            payload = msg.get("payload", {})
-
-            if ev_type == "ContentPart" and payload.get("type") == "text":
-                text = payload.get("text", "")
-                if text:
-                    await self._enqueue(text)
-            elif ev_type == "ContentPart" and payload.get("type") == "think" and self.show_thoughts:
-                think = payload.get("think", "")
-                if think:
-                    await self._send_now(f"*thinking…* {think[:200]}")
-            elif ev_type == "ToolCall" and self.show_tool_progress:
-                fn = payload.get("function", {})
-                name = fn.get("name", "tool")
-                await self._send_now(f"🔧 `{name}`")
-            elif ev_type == "ToolResult" and self.show_tool_progress:
-                rv = payload.get("return_value", {})
-                is_err = rv.get("is_error", False)
-                icon = "✗" if is_err else "✓"
-                await self._send_now(f"{icon} `{payload.get('id', 'tool')}`")
-
-        self.tail.on_event(on_event)
+        self.tail.on_event(self._handle_wire_event)
         await self.tail.start(from_beginning=from_beginning)
         log.info("tail started for thread %s (from_beginning=%s)",
                  self.thread.id, from_beginning)
+
+    async def _handle_wire_event(self, ev: dict) -> None:
+        """Dispatch a single wire.jsonl event to the appropriate output path.
+
+        Extracted from start_tail's closure so it can be unit-tested directly.
+        """
+        msg = ev.get("message", ev)
+        ev_type = msg.get("type", "unknown")
+        payload = msg.get("payload", {})
+
+        if ev_type == "ContentPart" and payload.get("type") == "text":
+            text = payload.get("text", "")
+            if text:
+                await self._enqueue(text)
+        elif ev_type == "ContentPart" and payload.get("type") == "think" and self.show_thoughts:
+            think = payload.get("think", "")
+            if think:
+                await self._send_now(f"*thinking…* {think[:200]}")
+        elif ev_type == "ToolCall" and self.show_tool_progress:
+            fn = payload.get("function", {})
+            name = fn.get("name", "tool")
+            await self._send_now(f"🔧 `{name}`")
+        elif ev_type == "ToolResult" and self.show_tool_progress:
+            rv = payload.get("return_value", {})
+            is_err = rv.get("is_error", False)
+            icon = "✗" if is_err else "✓"
+            await self._send_now(f"{icon} `{payload.get('id', 'tool')}`")
 
     async def ensure_tail(self, session_uuid: str, cwd: str, client: "discord.Client",
                           *, from_beginning: bool = False) -> bool:

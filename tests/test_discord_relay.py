@@ -157,3 +157,121 @@ async def test_flush_appends_via_edit_when_within_limit():
 
     existing.edit.assert_awaited_once_with(content="previous text more")
     thread.send.assert_not_awaited()
+
+
+# ── ThreadRelay._handle_wire_event branches ──────────────────────────────
+
+async def test_event_text_content_enqueues_to_debounce_buffer():
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({
+        "type": "ContentPart",
+        "payload": {"type": "text", "text": "hello"},
+    })
+    await asyncio.sleep(1.0)
+    thread.send.assert_awaited_once_with("hello")
+
+
+async def test_event_empty_text_does_nothing():
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({
+        "type": "ContentPart",
+        "payload": {"type": "text", "text": ""},
+    })
+    await asyncio.sleep(1.0)
+    thread.send.assert_not_awaited()
+
+
+async def test_event_think_suppressed_by_default():
+    """show_thoughts=False (default) → think events produce no Discord output."""
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({
+        "type": "ContentPart",
+        "payload": {"type": "think", "think": "deep thought"},
+    })
+    await asyncio.sleep(0.2)
+    thread.send.assert_not_awaited()
+
+
+async def test_event_think_shown_when_enabled():
+    relay, thread = _make_relay()
+    relay.show_thoughts = True
+    await relay._handle_wire_event({
+        "type": "ContentPart",
+        "payload": {"type": "think", "think": "deep thought"},
+    })
+    await asyncio.sleep(0.2)
+    thread.send.assert_awaited_once()
+    sent = thread.send.await_args.args[0]
+    assert "thinking" in sent
+    assert "deep thought" in sent
+
+
+async def test_event_toolcall_suppressed_by_default():
+    """show_tool_progress=False (default) — 🔧 Shell-style spam stays out."""
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({
+        "type": "ToolCall",
+        "payload": {"function": {"name": "Shell"}},
+    })
+    await asyncio.sleep(0.2)
+    thread.send.assert_not_awaited()
+
+
+async def test_event_toolcall_shown_when_enabled():
+    relay, thread = _make_relay()
+    relay.show_tool_progress = True
+    await relay._handle_wire_event({
+        "type": "ToolCall",
+        "payload": {"function": {"name": "Shell"}},
+    })
+    await asyncio.sleep(0.2)
+    thread.send.assert_awaited_once()
+    sent = thread.send.await_args.args[0]
+    assert "Shell" in sent
+    assert "🔧" in sent
+
+
+async def test_event_toolresult_success_icon():
+    relay, thread = _make_relay()
+    relay.show_tool_progress = True
+    await relay._handle_wire_event({
+        "type": "ToolResult",
+        "payload": {"id": "tool-1", "return_value": {"is_error": False}},
+    })
+    await asyncio.sleep(0.2)
+    sent = thread.send.await_args.args[0]
+    assert sent.startswith("✓")
+    assert "tool-1" in sent
+
+
+async def test_event_toolresult_error_icon():
+    relay, thread = _make_relay()
+    relay.show_tool_progress = True
+    await relay._handle_wire_event({
+        "type": "ToolResult",
+        "payload": {"id": "tool-2", "return_value": {"is_error": True}},
+    })
+    await asyncio.sleep(0.2)
+    sent = thread.send.await_args.args[0]
+    assert sent.startswith("✗")
+    assert "tool-2" in sent
+
+
+async def test_event_unwraps_outer_message_envelope():
+    """Some events arrive as {'message': {...}}. Inner payload must still classify."""
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({
+        "message": {
+            "type": "ContentPart",
+            "payload": {"type": "text", "text": "wrapped"},
+        }
+    })
+    await asyncio.sleep(1.0)
+    thread.send.assert_awaited_once_with("wrapped")
+
+
+async def test_event_unknown_type_is_ignored():
+    relay, thread = _make_relay()
+    await relay._handle_wire_event({"type": "WhateverNew", "payload": {}})
+    await asyncio.sleep(0.2)
+    thread.send.assert_not_awaited()

@@ -80,3 +80,80 @@ async def test_kill_thread_name_is_captured_before_delete():
                       new=AsyncMock(side_effect=CmuxError("gone"))):
         _, name = await bot._kill_session_and_thread(thread, "surf-1")
     assert name == "will-be-gone"
+
+
+# ── cleanup classification ───────────────────────────────────────────────
+
+def _row(thread_id: str, surface_id: str | None = "surf",
+         created_at: int = 0) -> bot.SessionRow:
+    import time as _t
+    return bot.SessionRow(
+        thread_id=thread_id, guild_id="g", channel_id="c",
+        owner_user_id="u", workspace_id="w", workspace_name=None,
+        cwd="/tmp", monitor_surface_id=surface_id, acp_session_id="a",
+        status="active", created_at=created_at,
+        last_active_at=created_at or int(_t.time()),
+    )
+
+
+def _thread(thread_id: int) -> MagicMock:
+    t = MagicMock()
+    t.id = thread_id
+    return t
+
+
+async def test_classify_marks_unregistered_threads_as_orphans():
+    threads = [_thread(1), _thread(2)]
+    active = {"1": _row("1")}
+    zombies, unreg = await bot._classify_threads_for_cleanup(
+        threads, active, cmux_ok=True,
+        surface_probe=AsyncMock(return_value="alive"),
+        now=10_000)
+    assert unreg == {"2"}
+    assert zombies == set()
+
+
+async def test_classify_marks_dead_surface_as_zombie():
+    threads = [_thread(1)]
+    active = {"1": _row("1", surface_id="surf-1", created_at=0)}
+    zombies, unreg = await bot._classify_threads_for_cleanup(
+        threads, active, cmux_ok=True,
+        surface_probe=AsyncMock(side_effect=CmuxError("gone")),
+        now=10_000)
+    assert zombies == {"1"}
+    assert unreg == set()
+
+
+async def test_classify_disables_zombie_detection_when_cmux_down():
+    """Mass-delete protection: if cmux is unreachable, never flag zombies."""
+    threads = [_thread(1), _thread(2)]
+    active = {"1": _row("1"), "2": _row("2")}
+    probe = AsyncMock(side_effect=CmuxError("never called"))
+    zombies, unreg = await bot._classify_threads_for_cleanup(
+        threads, active, cmux_ok=False, surface_probe=probe, now=10_000)
+    assert zombies == set()
+    assert unreg == set()
+    probe.assert_not_awaited()
+
+
+async def test_classify_respects_grace_period_for_new_sessions():
+    """A registry row newer than grace_sec must not be probed/zombified."""
+    threads = [_thread(1)]
+    active = {"1": _row("1", surface_id="surf-1", created_at=99)}
+    probe = AsyncMock(side_effect=CmuxError("would-fail"))
+    zombies, unreg = await bot._classify_threads_for_cleanup(
+        threads, active, cmux_ok=True, surface_probe=probe, now=100,
+        grace_sec=30)
+    assert zombies == set()
+    probe.assert_not_awaited()
+
+
+async def test_classify_skips_rows_without_surface_id():
+    """monitor_surface_id=None → can't verify → not flagged as zombie."""
+    threads = [_thread(1)]
+    active = {"1": _row("1", surface_id=None, created_at=0)}
+    probe = AsyncMock(side_effect=CmuxError("would-fail"))
+    zombies, unreg = await bot._classify_threads_for_cleanup(
+        threads, active, cmux_ok=True, surface_probe=probe, now=10_000)
+    assert zombies == set()
+    probe.assert_not_awaited()

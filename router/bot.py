@@ -247,6 +247,53 @@ async def new_session_cmd(interaction: discord.Interaction):
 
 # ── Additional slash commands ─────────────────────────────────────────────────
 
+ZOMBIE_GRACE_SEC = 30  # protect freshly-created sessions from cmux propagation lag
+
+
+async def _classify_threads_for_cleanup(
+    channel_threads: list,
+    active_by_thread: dict,
+    *,
+    cmux_ok: bool,
+    surface_probe,
+    now: int,
+    grace_sec: int = ZOMBIE_GRACE_SEC,
+) -> tuple[set[str], set[str]]:
+    """Classify channel threads into (zombie_ids, unregistered_ids).
+
+    - unregistered: thread is in the channel but has no active registry row
+    - zombie: registry says 'active' but cmux surface ping fails
+
+    Skips zombie classification entirely when cmux is unreachable so a single
+    cmux outage doesn't cause mass-delete of the whole fleet. Threads with
+    no monitor_surface_id, or those created within `grace_sec` (cmux state
+    may not have propagated yet), are also kept off the zombie list.
+
+    Extracted from cleanup_cmd so it can be unit-tested without spinning up
+    Discord interactions.
+    """
+    zombie_ids: set[str] = set()
+    unregistered_ids: set[str] = set()
+
+    async def _classify(t) -> None:
+        tid = str(t.id)
+        row = active_by_thread.get(tid)
+        if not row:
+            unregistered_ids.add(tid)
+            return
+        if not cmux_ok or not row.monitor_surface_id:
+            return
+        if now - (row.created_at or 0) < grace_sec:
+            return
+        try:
+            await surface_probe(row.monitor_surface_id)
+        except CmuxError:
+            zombie_ids.add(tid)
+
+    await asyncio.gather(*(_classify(t) for t in channel_threads))
+    return zombie_ids, unregistered_ids
+
+
 async def _kill_session_and_thread(thread: discord.Thread,
                                     surface_id: str | None) -> tuple[str, str]:
     """Shutdown the session, verify cmux surface closed, then delete the
@@ -694,27 +741,13 @@ async def cleanup_cmd(interaction: discord.Interaction):
         log.warning("cmux preflight failed: %s; zombie detection disabled", e)
         cmux_ok = False
 
-    ZOMBIE_GRACE_SEC = 30  # protect freshly-created sessions from propagation lag
-    zombie_ids: set[str] = set()
-    unregistered_ids: set[str] = set()
-    now = int(time.time())
-
-    async def _classify(t: discord.Thread):
-        tid = str(t.id)
-        row = active_by_thread.get(tid)
-        if not row:
-            unregistered_ids.add(tid)
-            return
-        if not cmux_ok or not row.monitor_surface_id:
-            return  # can't verify → trust registry
-        if now - (row.created_at or 0) < ZOMBIE_GRACE_SEC:
-            return  # grace period for fresh sessions
-        try:
-            await surface_read_text(row.monitor_surface_id)
-        except CmuxError:
-            zombie_ids.add(tid)
-
-    await asyncio.gather(*(_classify(t) for t in channel_threads))
+    zombie_ids, unregistered_ids = await _classify_threads_for_cleanup(
+        channel_threads,
+        active_by_thread,
+        cmux_ok=cmux_ok,
+        surface_probe=surface_read_text,
+        now=int(time.time()),
+    )
 
     orphan_ids = unregistered_ids | zombie_ids
     orphan_threads = [t for t in channel_threads if str(t.id) in orphan_ids]
