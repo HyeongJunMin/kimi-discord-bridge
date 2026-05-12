@@ -260,3 +260,73 @@ async def test_send_to_surface_resets_message_anchor():
     with patch.object(bot, "surface_send_text", new=AsyncMock()):
         await sess.send_to_surface("hi", MagicMock())
     relay.reset_message_anchor.assert_called_once()
+
+
+# ── _short_tab_title pure helper ─────────────────────────────────────────
+
+def test_short_tab_title_uses_workspace_prefix_and_thread_suffix():
+    assert bot._short_tab_title("kimi-hub", "kimi-kimi-hub-3590") == "kim-3590"
+    assert bot._short_tab_title("rv-sol", "kimi-rv-sol-9821") == "rv--9821"
+
+
+def test_short_tab_title_falls_back_to_ws_when_workspace_name_is_none():
+    assert bot._short_tab_title(None, "kimi-anything-1234") == "ws-1234"
+
+
+def test_short_tab_title_short_workspace_kept_intact():
+    assert bot._short_tab_title("ab", "kimi-ab-1234") == "ab-1234"
+
+
+def test_short_tab_title_returns_prefix_only_when_thread_has_no_suffix():
+    assert bot._short_tab_title("workspace", "plain") == "wor"
+
+
+# ── create_session renames cmux tab ──────────────────────────────────────
+
+async def test_create_session_renames_cmux_tab_with_short_title(monkeypatch):
+    """After surface creation, rename_tab is called with workspace_name[:3]
+    + thread suffix so cmux tab strips stay readable."""
+    thread = MagicMock()
+    thread.id = 12345
+    thread.name = "kimi-kimi-hub-3590"
+    thread.guild = MagicMock(id=11111)
+    thread.parent_id = 22222
+
+    rename_mock = AsyncMock()
+    fake_banner = "Session: 12345678-1234-1234-1234-123456789012\n"
+    with patch.object(bot, "create_surface",
+                      new=AsyncMock(return_value={"surface_id": "surf-XYZ"})), \
+         patch.object(bot, "surface_send_text", new=AsyncMock()), \
+         patch.object(bot, "surface_read_text",
+                      new=AsyncMock(return_value=fake_banner)), \
+         patch.object(bot, "rename_tab", new=rename_mock), \
+         patch.object(bot.router.registry, "insert"):
+        await bot.router.create_session(
+            thread=thread, owner_id=999,
+            workspace_id="ws-1", workspace_name="kimi-hub", cwd="/tmp")
+
+    rename_mock.assert_awaited_once_with("surf-XYZ", "kim-3590")
+
+
+async def test_create_session_continues_when_rename_fails(monkeypatch):
+    """rename_tab raising must not abort session creation — cosmetic only."""
+    thread = MagicMock()
+    thread.id = 99
+    thread.name = "kimi-rename-fails"
+    thread.guild = MagicMock(id=1)
+    thread.parent_id = 2
+
+    fake_banner = "Session: 12345678-1234-1234-1234-123456789012\n"
+    with patch.object(bot, "create_surface",
+                      new=AsyncMock(return_value={"surface_id": "surf-1"})), \
+         patch.object(bot, "surface_send_text", new=AsyncMock()), \
+         patch.object(bot, "surface_read_text",
+                      new=AsyncMock(return_value=fake_banner)), \
+         patch.object(bot, "rename_tab",
+                      new=AsyncMock(side_effect=RuntimeError("cmux down"))), \
+         patch.object(bot.router.registry, "insert") as ins:
+        sess, _ = await bot.router.create_session(
+            thread=thread, owner_id=1,
+            workspace_id="ws-1", workspace_name="ws", cwd="/tmp")
+    assert sess is not None
+    ins.assert_called_once()

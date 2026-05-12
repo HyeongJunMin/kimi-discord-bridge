@@ -93,6 +93,27 @@ async def close_surface(surface_id: str) -> None:
     await _rpc("surface.close", {"surface_id": surface_id})
 
 
+async def rename_tab(surface_id: str, title: str) -> None:
+    """Set the cmux tab title for a surface (so users can match a Discord
+    thread to its cmux surface visually).
+
+    Uses the `cmux rename-tab` CLI command — the underlying socket method
+    name isn't exposed via `cmux rpc`, but the CLI wrapper works. Failure
+    is logged as a warning, not raised: a rename failure should not abort
+    session creation.
+    """
+    import asyncio as _asyncio
+    proc = await _asyncio.create_subprocess_exec(
+        CMUX_CMD, "rename-tab", "--surface", surface_id, "--", title,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        log.warning("rename-tab failed for %s: %s",
+                    surface_id, err.decode().strip() or out.decode().strip())
+
+
 async def ensure_cmux_running(timeout: float = 15.0) -> bool:
     """Launch the cmux app if its RPC socket isn't responding.
 

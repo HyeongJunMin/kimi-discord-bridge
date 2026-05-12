@@ -20,7 +20,8 @@ from discord import app_commands
 
 from .cmux_client import (list_workspaces, create_workspace, create_surface,
                           surface_send_text, surface_read_text, close_surface,
-                          CmuxError, list_surfaces, ensure_cmux_running)
+                          CmuxError, list_surfaces, ensure_cmux_running,
+                          rename_tab)
 from .registry import Registry, SessionRow
 from .discord_relay import ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl
 
@@ -105,6 +106,13 @@ class Router:
         surf_id = (surface_info or {}).get("surface_id") or (surface_info or {}).get("id")
         if not surf_id:
             raise RuntimeError("Failed to create cmux surface")
+
+        # Tag the cmux tab so the user can match a Discord thread to its
+        # cmux surface visually. Cosmetic — failure is non-fatal.
+        try:
+            await rename_tab(surf_id, _short_tab_title(workspace_name, thread.name))
+        except Exception as e:
+            log.warning("rename_tab failed: %s", e)
 
         # Start kimi in the surface.
         # KIMI_CLI_NO_AUTO_UPDATE=1 suppresses the interactive upgrade gate
@@ -259,6 +267,25 @@ async def new_session_cmd(interaction: discord.Interaction):
 # ── Additional slash commands ─────────────────────────────────────────────────
 
 ZOMBIE_GRACE_SEC = 30  # protect freshly-created sessions from cmux propagation lag
+
+
+def _short_tab_title(workspace_name: str | None, thread_name: str) -> str:
+    """Compact cmux tab title for /new sessions.
+
+    Format: '{workspace_name[:3]}-{trailing 4-digit suffix from thread}'.
+
+    The 4-digit suffix is `int(time.time()) % 10000` baked into the thread
+    name at creation time (effectively a random-looking identifier — the
+    user just needs to visually match a tab to a thread, exact uniqueness
+    isn't required).
+
+    Example:
+        ws='kimi-hub', thread='kimi-kimi-hub-3590' → 'kim-3590'
+        ws=None,       thread='kimi-foo-9999'      → 'ws-9999'
+    """
+    prefix = (workspace_name or "ws")[:3] or "ws"
+    suffix = thread_name.rsplit("-", 1)[-1] if "-" in thread_name else ""
+    return f"{prefix}-{suffix}" if suffix else prefix
 
 
 async def _classify_threads_for_cleanup(
@@ -664,6 +691,12 @@ async def attach_cmd(interaction: discord.Interaction):
             f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"
         )
 
+        # Match cmux tab title to the new thread (same rule as /new).
+        try:
+            await rename_tab(surf_id, _short_tab_title(ws_name, thread.name))
+        except Exception as e:
+            log.warning("rename_tab failed for attach: %s", e)
+
         # Build WireSession without creating a new surface
         sess = WireSession(
             thread_id=thread.id,
@@ -905,6 +938,13 @@ async def rebind_cmd(interaction: discord.Interaction):
         type=discord.ChannelType.public_thread,
         auto_archive_duration=1440,
     )
+
+    # Match cmux tab title to the new thread (same rule as /new).
+    try:
+        await rename_tab(old_sess.surface_id,
+                          _short_tab_title(row.workspace_name, new_thread.name))
+    except Exception as e:
+        log.warning("rename_tab failed for rebind: %s", e)
 
     # Move the session: update in-memory dict
     router.sessions.pop(old_thread_id, None)

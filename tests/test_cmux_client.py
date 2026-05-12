@@ -220,3 +220,37 @@ async def test_create_surface_sets_workspace_and_type(monkeypatch):
     assert params["workspace_id"] == "ws-1"
     assert params["type"] == "terminal"
     assert params["focus"] is True
+
+
+# ── rename_tab ────────────────────────────────────────────────────────────
+
+async def test_rename_tab_invokes_correct_cli(monkeypatch):
+    """rename_tab must shell out to `cmux rename-tab --surface <id> -- <title>`."""
+    captured: list = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.extend(args)
+        return _fake_proc(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        fake_create_subprocess_exec)
+
+    await cmux_client.rename_tab("surf-1", "kimi-kimi-hub-3590")
+
+    assert captured[0] == cmux_client.CMUX_CMD
+    assert captured[1] == "rename-tab"
+    assert "--surface" in captured
+    assert "surf-1" in captured
+    assert "--" in captured
+    assert "kimi-kimi-hub-3590" in captured
+    # Title comes after "--" so dashes in title aren't parsed as flags.
+    assert captured.index("kimi-kimi-hub-3590") > captured.index("--")
+
+
+async def test_rename_tab_swallows_failure(monkeypatch):
+    """Non-zero exit must not raise — rename is cosmetic only."""
+    async def failing(*args, **kwargs):
+        return _fake_proc(stderr=b"tab not found", returncode=1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing)
+    await cmux_client.rename_tab("nonexistent-surf", "title")
