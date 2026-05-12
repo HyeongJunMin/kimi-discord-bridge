@@ -247,10 +247,13 @@ async def test_rename_tab_invokes_correct_cli(monkeypatch):
     assert captured.index("kimi-kimi-hub-3590") > captured.index("--")
 
 
-async def test_rename_tab_swallows_failure(monkeypatch):
-    """Non-zero exit must not raise — rename is cosmetic only."""
+async def test_rename_tab_raises_on_failure(monkeypatch):
+    """Non-zero exit (e.g. surface gone) must raise CmuxError so callers
+    like /rename can report the real outcome instead of false-positive."""
     async def failing(*args, **kwargs):
         return _fake_proc(stderr=b"tab not found", returncode=1)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", failing)
-    await cmux_client.rename_tab("nonexistent-surf", "title")
+    with pytest.raises(CmuxError) as exc:
+        await cmux_client.rename_tab("nonexistent-surf", "title")
+    assert "tab not found" in str(exc.value)

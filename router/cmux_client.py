@@ -98,9 +98,11 @@ async def rename_tab(surface_id: str, title: str) -> None:
     thread to its cmux surface visually).
 
     Uses the `cmux rename-tab` CLI command — the underlying socket method
-    name isn't exposed via `cmux rpc`, but the CLI wrapper works. Failure
-    is logged as a warning, not raised: a rename failure should not abort
-    session creation.
+    isn't exposed via `cmux rpc`, but the CLI wrapper works. Raises
+    CmuxError on non-zero exit (e.g. surface was closed externally) so
+    callers like /rename can report the real outcome instead of always
+    claiming success. Cosmetic callers (/new, /attach, /rebind) already
+    wrap this in try/except to keep session creation going regardless.
     """
     import asyncio as _asyncio
     proc = await _asyncio.create_subprocess_exec(
@@ -110,8 +112,9 @@ async def rename_tab(surface_id: str, title: str) -> None:
     )
     out, err = await proc.communicate()
     if proc.returncode != 0:
-        log.warning("rename-tab failed for %s: %s",
-                    surface_id, err.decode().strip() or out.decode().strip())
+        msg = err.decode().strip() or out.decode().strip()
+        log.warning("rename-tab failed for %s: %s", surface_id, msg)
+        raise CmuxError(f"cmux rename-tab failed: {msg}")
 
 
 async def ensure_cmux_running(timeout: float = 15.0) -> bool:
