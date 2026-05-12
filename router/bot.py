@@ -502,6 +502,66 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+async def _do_rename(thread: discord.Thread, new_name: str, row) -> str:
+    """Rename a Discord thread and (if active) its bound cmux surface.
+
+    Pre-condition: caller has already validated permissions and that
+    new_name is non-empty after strip. Returns a one-line status message
+    suitable for ephemeral followup.
+    """
+    truncated = new_name[:100]  # Discord thread.name limit
+    truncated_note = " (100자 초과로 자름)" if len(new_name) > 100 else ""
+
+    parts: list[str] = []
+    try:
+        await thread.edit(name=truncated)
+        parts.append(f"thread ✓{truncated_note}")
+    except Exception as e:
+        log.warning("thread.edit failed: %s", e)
+        parts.append(f"thread ⚠️ 실패 ({e})")
+
+    has_surface = bool(row and row.monitor_surface_id and row.status == "active")
+    if has_surface:
+        try:
+            await rename_tab(row.monitor_surface_id, truncated)
+            parts.append("surface ✓")
+        except Exception as e:
+            log.warning("rename_tab failed: %s", e)
+            parts.append(f"surface ⚠️ 실패 ({e})")
+    else:
+        parts.append("surface 없음(thread만 변경)")
+
+    return "✏️ 이름 변경: " + " · ".join(parts)
+
+
+@tree.command(name="rename", description="현재 thread와 연결된 cmux surface 이름을 변경합니다")
+@app_commands.describe(new_name="새 이름 (Discord 100자 한도 초과 시 잘림)")
+async def rename_cmd(interaction: discord.Interaction, new_name: str):
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message("thread에서만 사용 가능해요.", ephemeral=True)
+        return
+    name = new_name.strip()
+    if not name:
+        await interaction.response.send_message(
+            "⚠️ 빈 이름은 사용할 수 없어요.", ephemeral=True)
+        return
+
+    thread = interaction.channel
+    row = router.registry.get_by_thread(str(thread.id))
+    # Owner check: enforced only when a registry row exists. True orphans
+    # (no row) can be renamed by anyone in the thread, matching /kill's
+    # cleanup policy.
+    if row and str(interaction.user.id) != row.owner_user_id:
+        await interaction.response.send_message(
+            "세션 소유자만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    # thread.edit / rename_tab are both round-trips → defer.
+    await interaction.response.defer(ephemeral=True)
+    status = await _do_rename(thread, name, row)
+    await interaction.followup.send(status, ephemeral=True)
+
+
 @tree.command(name="stop", description="진행 중인 kimi 응답을 멈춥니다 (ESC 전송)")
 async def stop_cmd(interaction: discord.Interaction):
     if not isinstance(interaction.channel, discord.Thread):
@@ -598,10 +658,35 @@ async def model_cmd(interaction: discord.Interaction, name: str):
 
 @tree.command(name="attach", description="로컬에서 실행 중인 kimi-cli를 Discord thread에 연결합니다")
 async def attach_cmd(interaction: discord.Interaction):
-    """Attach an already-running local kimi surface to a new Discord thread."""
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("텍스트 채널에서만 사용 가능해요.", ephemeral=True)
+    """Attach an already-running local kimi surface to a Discord thread.
+
+    Called from a TextChannel: creates a new thread.
+    Called from a Thread: attaches to that same thread (requires no active
+    session already bound to it and the caller to own any pre-existing row).
+    """
+    ch = interaction.channel
+    is_thread = isinstance(ch, discord.Thread)
+    is_textch = isinstance(ch, discord.TextChannel)
+    if not (is_thread or is_textch):
+        await interaction.response.send_message(
+            "텍스트 채널 또는 thread에서만 사용 가능해요.", ephemeral=True)
         return
+
+    if is_thread:
+        row = router.registry.get_by_thread(str(ch.id))
+        if row and row.owner_user_id != str(interaction.user.id):
+            await interaction.response.send_message(
+                "이 thread는 다른 사용자의 세션입니다.", ephemeral=True)
+            return
+        # Only block if BOTH registry says active AND we have it in-memory.
+        # A bare 'active' row with no in-memory session is a zombie (bot
+        # restart leaves status='active' on purpose to preserve cmux surfaces
+        # — see commit f9fdfd2) and re-attaching is the supported recovery.
+        if row and row.status == "active" and ch.id in router.sessions:
+            await interaction.response.send_message(
+                "이 thread에 이미 활성 세션이 있어요. `/kill` 후 다시 시도하세요.",
+                ephemeral=True)
+            return
 
     await interaction.response.defer(ephemeral=True)
 
@@ -690,14 +775,26 @@ async def attach_cmd(interaction: discord.Interaction):
         session_uuid = cand["session_uuid"]
         cwd = cand["cwd"]
 
-        # Create thread
-        thread = await inter.channel.create_thread(
-            name=f"kimi-attach-{session_uuid[:8]}-{int(time.time())%10000}",
-            type=discord.ChannelType.public_thread,
-            auto_archive_duration=1440,
-        )
-        await inter.followup.send(
-            f"✓ Thread 생성: {thread.mention}", ephemeral=True)
+        # Race re-check: candidate list was built before user picked. Another
+        # /attach in the same window could have grabbed this surface meanwhile.
+        if any(r.monitor_surface_id == surf_id
+               for r in router.registry.list_active()):
+            await inter.followup.send(
+                "이 surface는 방금 다른 thread에 연결됐어요.", ephemeral=True)
+            return
+
+        if is_thread:
+            thread = ch
+            await inter.followup.send(
+                f"✓ 이 thread에 연결합니다.", ephemeral=True)
+        else:
+            thread = await inter.channel.create_thread(
+                name=f"kimi-attach-{session_uuid[:8]}-{int(time.time())%10000}",
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440,
+            )
+            await inter.followup.send(
+                f"✓ Thread 생성: {thread.mention}", ephemeral=True)
         await thread.send(
             f"🔗 로컬 surface를 연결 중...\n"
             f"session=`{session_uuid[:8]}…` · surface `{surf_id}`"

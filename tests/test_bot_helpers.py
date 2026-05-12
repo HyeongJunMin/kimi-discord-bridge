@@ -248,6 +248,85 @@ def test_short_tab_title_returns_prefix_only_when_thread_has_no_suffix():
     assert bot._short_tab_title("workspace", "plain") == "wor"
 
 
+# ── _do_rename helper ────────────────────────────────────────────────────
+
+def _row_for_rename(surface_id="surf-1", status="active"):
+    return bot.SessionRow(
+        thread_id="1", guild_id="g", channel_id="c",
+        owner_user_id="u", workspace_id="w", workspace_name=None,
+        cwd="/tmp", monitor_surface_id=surface_id, acp_session_id="a",
+        status=status, created_at=0, last_active_at=0,
+    )
+
+
+async def test_do_rename_active_session_renames_both():
+    thread = MagicMock()
+    thread.edit = AsyncMock()
+    rename_mock = AsyncMock()
+    with patch.object(bot, "rename_tab", new=rename_mock):
+        status = await bot._do_rename(thread, "new-name", _row_for_rename())
+    thread.edit.assert_awaited_once_with(name="new-name")
+    rename_mock.assert_awaited_once_with("surf-1", "new-name")
+    assert "thread ✓" in status
+    assert "surface ✓" in status
+
+
+async def test_do_rename_without_row_only_changes_thread():
+    thread = MagicMock()
+    thread.edit = AsyncMock()
+    rename_mock = AsyncMock()
+    with patch.object(bot, "rename_tab", new=rename_mock):
+        status = await bot._do_rename(thread, "fresh", None)
+    thread.edit.assert_awaited_once_with(name="fresh")
+    rename_mock.assert_not_awaited()
+    assert "thread ✓" in status
+    assert "surface 없음" in status
+
+
+async def test_do_rename_dead_session_skips_surface():
+    """status='dead' rows still get thread rename but no surface ping."""
+    thread = MagicMock()
+    thread.edit = AsyncMock()
+    rename_mock = AsyncMock()
+    row = _row_for_rename(status="dead")
+    with patch.object(bot, "rename_tab", new=rename_mock):
+        status = await bot._do_rename(thread, "x", row)
+    rename_mock.assert_not_awaited()
+    assert "surface 없음" in status
+
+
+async def test_do_rename_truncates_over_100_chars():
+    thread = MagicMock()
+    thread.edit = AsyncMock()
+    long_name = "a" * 150
+    with patch.object(bot, "rename_tab", new=AsyncMock()):
+        status = await bot._do_rename(thread, long_name, _row_for_rename())
+    sent_name = thread.edit.await_args.kwargs["name"]
+    assert len(sent_name) == 100
+    assert "100자 초과로 자름" in status
+
+
+async def test_do_rename_reports_thread_failure():
+    thread = MagicMock()
+    thread.edit = AsyncMock(side_effect=RuntimeError("rate limited"))
+    with patch.object(bot, "rename_tab", new=AsyncMock()) as rt:
+        status = await bot._do_rename(thread, "x", _row_for_rename())
+    assert "thread ⚠️ 실패" in status
+    # surface rename still attempted independently
+    rt.assert_awaited_once()
+    assert "surface ✓" in status
+
+
+async def test_do_rename_reports_surface_failure():
+    thread = MagicMock()
+    thread.edit = AsyncMock()
+    with patch.object(bot, "rename_tab",
+                      new=AsyncMock(side_effect=RuntimeError("cmux down"))):
+        status = await bot._do_rename(thread, "x", _row_for_rename())
+    assert "thread ✓" in status
+    assert "surface ⚠️ 실패" in status
+
+
 async def test_create_session_continues_when_rename_fails(monkeypatch):
     """rename_tab raising must not abort session creation — it's cosmetic."""
     thread = MagicMock()
