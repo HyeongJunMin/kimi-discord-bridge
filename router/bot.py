@@ -55,7 +55,18 @@ class WireSession:
         # turn — i.e. only AFTER we send the first user message. So the order
         # must be: send first, then wait for the file. Reversing this caused
         # a 60s timeout on the first user message and silently lost replies.
-        await surface_send_text(self.surface_id, text + "\n")
+        #
+        # Wrap the payload in bracketed-paste escapes so embedded newlines
+        # stay as literal newlines inside the kimi-cli input box instead of
+        # being interpreted as Enter (which would submit the partial buffer
+        # one line at a time). The trailing \r is the actual submit
+        # keystroke. Verified against kimi-cli's TUI in a live probe — it
+        # acknowledges paste mode explicitly. Any stray \x1b[200~/\x1b[201~
+        # in the user text is stripped first so the wrapper can't be
+        # smuggled past.
+        clean = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+        payload = f"\x1b[200~{clean}\x1b[201~\r"
+        await surface_send_text(self.surface_id, payload)
         if self.relay and not self.relay._tail_started:
             # First tail start: read from beginning so we don't miss the
             # response that kimi is already streaming for the message we

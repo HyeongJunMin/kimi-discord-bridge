@@ -157,3 +157,106 @@ async def test_classify_skips_rows_without_surface_id():
         threads, active, cmux_ok=True, surface_probe=probe, now=10_000)
     assert zombies == set()
     probe.assert_not_awaited()
+
+
+# ── WireSession.send_to_surface bracketed paste ──────────────────────────
+
+def _make_wire_session_with_mock_relay(tail_started: bool = False):
+    sess = bot.WireSession(
+        thread_id=999,
+        surface_id="surf-1",
+        session_uuid="uuid-1",
+        cwd="/tmp/x",
+        owner_id=1,
+    )
+    relay = MagicMock()
+    relay._tail_started = tail_started
+    relay.ensure_tail = AsyncMock(return_value=True)
+    relay.reset_message_anchor = MagicMock()
+    sess.relay = relay
+    return sess, relay
+
+
+async def test_send_to_surface_wraps_text_in_bracketed_paste_with_cr_submit():
+    """The TUI receives text wrapped in bracketed-paste escapes and a final
+    \\r as the submit keystroke. This preserves internal newlines."""
+    sess, _ = _make_wire_session_with_mock_relay(tail_started=True)
+    send_mock = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=send_mock):
+        await sess.send_to_surface("hi", MagicMock())
+    send_mock.assert_awaited_once_with("surf-1", "\x1b[200~hi\x1b[201~\r")
+
+
+async def test_send_to_surface_preserves_internal_newlines():
+    """Multi-image and multi-line messages keep their newlines so kimi sees
+    them as one paste (one submit), not N separate Enter presses."""
+    sess, _ = _make_wire_session_with_mock_relay(tail_started=True)
+    send_mock = AsyncMock()
+    payload = "@/tmp/a.png\n@/tmp/b.png\n두 이미지 봐줘"
+    with patch.object(bot, "surface_send_text", new=send_mock):
+        await sess.send_to_surface(payload, MagicMock())
+    send_mock.assert_awaited_once_with(
+        "surf-1", f"\x1b[200~{payload}\x1b[201~\r")
+
+
+async def test_send_to_surface_strips_embedded_paste_escape_smuggling():
+    """Stray \\x1b[200~/\\x1b[201~ in user text must be stripped so they
+    can't break out of the paste wrapper."""
+    sess, _ = _make_wire_session_with_mock_relay(tail_started=True)
+    send_mock = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=send_mock):
+        await sess.send_to_surface(
+            "before\x1b[201~middle\x1b[200~after", MagicMock())
+    sent = send_mock.await_args.args[1]
+    assert sent.count("\x1b[200~") == 1
+    assert sent.count("\x1b[201~") == 1
+    assert sent.startswith("\x1b[200~before")
+    assert sent.endswith("after\x1b[201~\r")
+
+
+async def test_send_to_surface_sends_text_before_starting_tail():
+    """Regression (wire.jsonl ordering): surface_send_text first, ensure_tail
+    second. Otherwise we deadlock waiting for a file kimi hasn't made yet."""
+    sess, relay = _make_wire_session_with_mock_relay(tail_started=False)
+    call_order: list[str] = []
+
+    async def fake_send_text(surf_id, text):
+        call_order.append("send")
+
+    async def fake_ensure_tail(*args, **kwargs):
+        call_order.append("tail")
+        return True
+
+    relay.ensure_tail = AsyncMock(side_effect=fake_ensure_tail)
+    with patch.object(bot, "surface_send_text", new=fake_send_text):
+        await sess.send_to_surface("hi", MagicMock())
+
+    assert call_order == ["send", "tail"]
+
+
+async def test_send_to_surface_passes_from_beginning_true():
+    """First tail start should be from_beginning=True so we catch the
+    response kimi is already streaming for this very message."""
+    sess, relay = _make_wire_session_with_mock_relay(tail_started=False)
+    relay.ensure_tail = AsyncMock(return_value=True)
+    with patch.object(bot, "surface_send_text", new=AsyncMock()):
+        await sess.send_to_surface("hi", MagicMock())
+    relay.ensure_tail.assert_awaited_once()
+    kwargs = relay.ensure_tail.await_args.kwargs
+    assert kwargs.get("from_beginning") is True
+
+
+async def test_send_to_surface_skips_ensure_tail_when_already_started():
+    sess, relay = _make_wire_session_with_mock_relay(tail_started=True)
+    relay.ensure_tail = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=AsyncMock()) as send_mock:
+        await sess.send_to_surface("hi", MagicMock())
+    send_mock.assert_awaited_once()
+    relay.ensure_tail.assert_not_awaited()
+
+
+async def test_send_to_surface_resets_message_anchor():
+    sess, relay = _make_wire_session_with_mock_relay(tail_started=True)
+    with patch.object(bot, "surface_send_text", new=AsyncMock()):
+        await sess.send_to_surface("hi", MagicMock())
+    relay.reset_message_anchor.assert_called_once()
