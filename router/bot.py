@@ -1168,13 +1168,28 @@ async def on_ready():
 
 
 async def _shutdown() -> None:
-    """Best-effort cleanup: stop sessions (closes surfaces), close DB, log out."""
-    log.info("shutdown: closing %d active session(s)", len(router.sessions))
-    for tid in list(router.sessions):
+    """Best-effort cleanup on bot process exit (SIGINT/SIGTERM).
+
+    Intentionally does NOT close cmux surfaces or mark sessions dead. The
+    bot may be restarting while the user wants their kimi-cli sessions to
+    keep running in cmux — they can `/attach` (or `/rebind`) once the bot
+    is back online to re-link Discord threads to the surviving surfaces.
+
+    Per-session destruction happens only through explicit user actions
+    (`/kill`, `/cleanup`, thread archive) which call `shutdown_session`
+    directly.
+    """
+    if router.sessions:
+        log.info("shutdown: leaving %d cmux session(s) alive for later /attach",
+                 len(router.sessions))
+    # Stop in-process relays (cancels debounce flush tasks) without touching
+    # the cmux surface itself.
+    for sess in list(router.sessions.values()):
         try:
-            await router.shutdown_session(tid)
+            if sess.relay:
+                await sess.relay.stop()
         except Exception:
-            log.exception("session %s shutdown failed", tid)
+            log.exception("relay stop failed for thread %s", sess.thread_id)
     try:
         router.registry.conn.close()
     except Exception:
