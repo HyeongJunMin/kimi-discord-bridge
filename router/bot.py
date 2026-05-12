@@ -33,6 +33,14 @@ REGISTRY_PATH = os.environ.get("SESSION_DB_PATH", "router.sqlite3")
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.environ.get("DISCORD_GUILD_ID") else None
 DEFAULT_WORK_DIR = os.environ.get("DEFAULT_WORK_DIR", os.path.expanduser("~"))
 
+# Image attachment relay (Discord → kimi).
+# /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
+# and deletes files untouched for >3 days) which gives us belt-and-suspenders
+# cleanup; we still explicitly remove the per-thread dir on shutdown_session.
+UPLOADS_ROOT = Path("/tmp/kimi-uploads")
+ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB — generous for camera-roll photos
+
 
 class WireSession:
     """Holds per-thread state (surface + relay)."""
@@ -107,8 +115,9 @@ class Router:
         if not surf_id:
             raise RuntimeError("Failed to create cmux surface")
 
-        # Tag the cmux tab so the user can match a Discord thread to its
-        # cmux surface visually. Cosmetic — failure is non-fatal.
+        # Tag the cmux tab with the Discord thread name so the user can
+        # eyeball which surface belongs to which thread (cmux defaults to a
+        # generic title like "Kimi Code" otherwise).
         try:
             await rename_tab(surf_id, _short_tab_title(workspace_name, thread.name))
         except Exception as e:
@@ -177,6 +186,9 @@ class Router:
         if sess:
             await sess.stop()
         self.registry.update_status(str(thread_id), "dead")
+        # Clean up any per-thread image uploads. macOS would clean /tmp
+        # eventually but we want explicit cleanup so /kill is deterministic.
+        _delete_upload_dir(thread_id)
 
 
 # ── Discord bot setup ─────────────────────────────────────────────────────────
@@ -708,12 +720,15 @@ async def attach_cmd(interaction: discord.Interaction):
         await sess.start_relay(thread, client)
         router.sessions[thread.id] = sess
 
-        # Start tail eagerly (surface already has kimi running)
-        wire_path = await wait_for_wire_jsonl(session_uuid, cwd, max_wait=30.0)
+        # wire.jsonl is created lazily on the first conversation turn. If the
+        # attached surface already has history, tail it now with
+        # from_beginning=False so past events don't get replayed into Discord.
+        # If not, fall through — send_to_surface → ensure_tail handles it on
+        # the first user message (same pattern as /new) and surfaces a
+        # "wire.jsonl not found" warning after 60s if it truly fails.
+        wire_path = await wait_for_wire_jsonl(session_uuid, cwd, max_wait=2.0)
         if wire_path and sess.relay:
-            await sess.relay.start_tail(wire_path, client)
-        elif sess.relay:
-            await thread.send("⚠️ wire.jsonl 찾기 실패 — 응답 수신이 불가능할 수 있습니다.")
+            await sess.relay.start_tail(wire_path, client, from_beginning=False)
 
         # Register in DB
         router.registry.insert(SessionRow(
@@ -984,6 +999,96 @@ async def rebind_cmd(interaction: discord.Interaction):
              old_sess.session_uuid, old_thread_id, new_thread.id)
 
 
+# ── Image attachment relay helpers ───────────────────────────────────────
+
+def _sanitize_filename(name: str) -> str:
+    """Strip path separators, traversal segments, NULL bytes, and leading
+    dots that would create a hidden file. Falls back to 'file' if the
+    result is empty. Length-capped at 80 chars to keep paths sane."""
+    import re as _re
+    if not name:
+        return "file"
+    # Take the basename component only — drop any directory parts the
+    # client may have included.
+    base = name.replace("\\", "/").split("/")[-1]
+    # Remove NULL bytes and ASCII control characters.
+    base = _re.sub(r"[\x00-\x1f]", "", base)
+    # Strip leading dots so we never write a hidden file.
+    base = base.lstrip(".")
+    # Whitelist: alnum + ._- ; replace everything else with _.
+    base = _re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    if not base:
+        base = "file"
+    return base[:80]
+
+
+def _is_allowed_image(filename: str) -> bool:
+    """Extension-based image gate. Allows png/jpg/jpeg/webp/gif."""
+    if not filename:
+        return False
+    lower = filename.lower()
+    return any(lower.endswith(ext) for ext in ALLOWED_IMAGE_EXTS)
+
+
+def _upload_dir(thread_id: int) -> Path:
+    return UPLOADS_ROOT / str(thread_id)
+
+
+def _delete_upload_dir(thread_id: int) -> None:
+    """Best-effort recursive deletion of a thread's upload directory."""
+    import shutil
+    target = _upload_dir(thread_id)
+    if target.exists():
+        try:
+            shutil.rmtree(target)
+        except Exception as e:
+            log.warning("upload dir cleanup failed for thread %s: %s",
+                        thread_id, e)
+
+
+async def _save_attachment(thread_id: int,
+                           attachment: discord.Attachment) -> tuple[Path | None, str | None]:
+    """Validate + save one Discord attachment.
+
+    Returns (saved_path, None) on success, or (None, reason) on rejection.
+    """
+    fname = attachment.filename or ""
+    if not _is_allowed_image(fname):
+        return None, f"`{fname}`: 이미지만 허용 (png/jpg/jpeg/webp/gif)"
+    if attachment.size and attachment.size > MAX_UPLOAD_BYTES:
+        mb = attachment.size / (1024 * 1024)
+        return None, f"`{fname}`: {mb:.1f}MB > 10MB 한도 초과"
+    safe_name = _sanitize_filename(fname)
+    dest_dir = _upload_dir(thread_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    # Prefix with timestamp-ms so concurrent same-name uploads don't collide.
+    dest = dest_dir / f"{int(time.time() * 1000)}-{safe_name}"
+    try:
+        data = await attachment.read()
+    except Exception as e:
+        log.warning("attachment download failed: %s", e)
+        return None, f"`{fname}`: 다운로드 실패 ({e})"
+    if len(data) > MAX_UPLOAD_BYTES:
+        # attachment.size can be unreliable; cap on actual bytes too.
+        return None, f"`{fname}`: {len(data)/(1024*1024):.1f}MB > 10MB 한도 초과"
+    try:
+        dest.write_bytes(data)
+    except Exception as e:
+        log.warning("attachment save failed: %s", e)
+        return None, f"`{fname}`: 디스크 저장 실패 ({e})"
+    return dest, None
+
+
+def _compose_message_with_attachments(text: str, paths: list[Path]) -> str:
+    """Build the final kimi-cli payload: one `@<abspath>` line per image,
+    followed by the user's text. kimi-cli's TUI recognises `@` as a file
+    mention (status bar literally shows `@: mention files`)."""
+    lines = [f"@{p}" for p in paths]
+    if text:
+        lines.append(text)
+    return "\n".join(lines)
+
+
 @client.event
 async def on_message(msg: discord.Message):
     if msg.author.bot:
@@ -995,7 +1100,30 @@ async def on_message(msg: discord.Message):
         return
     if str(msg.author.id) != row.owner_user_id:
         return  # only owner
-    await router.relay_user_message(msg.channel.id, msg.content, client)
+
+    # Handle image attachments (Discord → kimi via @path mention).
+    saved_paths: list[Path] = []
+    rejections: list[str] = []
+    if msg.attachments:
+        for att in msg.attachments:
+            path, reason = await _save_attachment(msg.channel.id, att)
+            if path:
+                saved_paths.append(path)
+            elif reason:
+                rejections.append(reason)
+        if rejections:
+            try:
+                await msg.channel.send(
+                    "⚠️ 일부 첨부를 건너뛰었어요:\n" + "\n".join(f"• {r}" for r in rejections))
+            except Exception:
+                log.exception("rejection notice send failed")
+        # If user sent ONLY rejected attachments (no text, no accepted images)
+        # there's nothing meaningful to forward — skip the relay.
+        if not saved_paths and not msg.content:
+            return
+
+    payload = _compose_message_with_attachments(msg.content, saved_paths)
+    await router.relay_user_message(msg.channel.id, payload, client)
 
 
 @client.event
