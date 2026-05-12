@@ -577,19 +577,51 @@ async def cleanup_cmd(interaction: discord.Interaction):
         await interaction.followup.send("이 채널에 활성 thread가 없어요.", ephemeral=True)
         return
 
-    # 3. Find threads not in registry
-    registered_thread_ids = {
-        r.thread_id for r in router.registry.list_active()
-    }
-    orphan_threads = [
-        t for t in channel_threads
-        if str(t.id) not in registered_thread_ids
-    ]
+    # 3. Classify each channel thread.
+    #    - unregistered: no active registry row → orphan (legacy definition)
+    #    - zombie: active registry row but cmux surface dead → orphan (new)
+    #    - live: registered + surface responsive (or within grace period)
+    active_by_thread = {r.thread_id: r for r in router.registry.list_active()}
+
+    # cmux reachability preflight: if cmux daemon itself is unreachable, every
+    # ping would fail and we'd wrongly flag the entire fleet as zombies.
+    cmux_ok = True
+    try:
+        await list_workspaces()
+    except CmuxError as e:
+        log.warning("cmux preflight failed: %s; zombie detection disabled", e)
+        cmux_ok = False
+
+    ZOMBIE_GRACE_SEC = 30  # protect freshly-created sessions from propagation lag
+    zombie_ids: set[str] = set()
+    unregistered_ids: set[str] = set()
+    now = int(time.time())
+
+    async def _classify(t: discord.Thread):
+        tid = str(t.id)
+        row = active_by_thread.get(tid)
+        if not row:
+            unregistered_ids.add(tid)
+            return
+        if not cmux_ok or not row.monitor_surface_id:
+            return  # can't verify → trust registry
+        if now - (row.created_at or 0) < ZOMBIE_GRACE_SEC:
+            return  # grace period for fresh sessions
+        try:
+            await surface_read_text(row.monitor_surface_id)
+        except CmuxError:
+            zombie_ids.add(tid)
+
+    await asyncio.gather(*(_classify(t) for t in channel_threads))
+
+    orphan_ids = unregistered_ids | zombie_ids
+    orphan_threads = [t for t in channel_threads if str(t.id) in orphan_ids]
 
     if not orphan_threads:
-        await interaction.followup.send(
-            "🧹 정리할 고아 thread가 없어요. 모든 활성 thread가 registry에 등록되어 있습니다.",
-            ephemeral=True)
+        msg = "🧹 정리할 고아 thread가 없어요. 모든 활성 thread가 살아있는 세션을 가지고 있습니다."
+        if not cmux_ok:
+            msg += "\n⚠️ cmux 응답 없음 — 좀비 탐지는 건너뜀 (registry 미등록 thread만 검사함)."
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
     # 4. Present options to delete them
@@ -597,18 +629,21 @@ async def cleanup_cmd(interaction: discord.Interaction):
     _thread_map: dict[str, discord.Thread] = {}
     for t in orphan_threads[:25]:
         label = t.name[:100]
-        _thread_map[str(t.id)] = t
+        tid = str(t.id)
+        _thread_map[tid] = t
+        desc = ("⚠️ 좀비: registry=active이지만 cmux surface 죽음"
+                if tid in zombie_ids else "registry에 없는 thread")
         options.append(discord.SelectOption(
-            label=label,
-            value=str(t.id),
-            description="이 thread를 삭제합니다 (복구 불가)"))
+            label=label, value=tid, description=desc[:100]))
 
     # Add "all" option if within limit
     if len(options) < 25:
+        z = len(zombie_ids)
+        u = len(unregistered_ids)
         options.insert(0, discord.SelectOption(
             label="🗑️ 모두 삭제",
             value="__all__",
-            description=f"{len(orphan_threads)}개를 모두 삭제 (복구 불가)"))
+            description=f"{len(orphan_threads)}개 삭제 (좀비 {z} + 미등록 {u}, 복구 불가)"[:100]))
 
     select = discord.ui.Select(placeholder="삭제할 고아 thread 선택", options=options)
 
@@ -625,9 +660,21 @@ async def cleanup_cmd(interaction: discord.Interaction):
             targets = [t for t in targets if t]
 
         deleted = 0
+        zombies_cleaned = 0
         errors = []
         for t in targets:
+            tid = str(t.id)
             try:
+                # Zombies still have stale registry rows + in-memory sessions.
+                # Tear those down before deleting the thread to keep state
+                # consistent. shutdown_session is idempotent and tolerates a
+                # dead surface (close_surface is wrapped in try/except).
+                if tid in zombie_ids:
+                    try:
+                        await router.shutdown_session(t.id)
+                        zombies_cleaned += 1
+                    except Exception as e:
+                        log.warning("zombie shutdown failed for thread %s: %s", t.id, e)
                 await t.delete()
                 deleted += 1
             except Exception as e:
@@ -635,6 +682,8 @@ async def cleanup_cmd(interaction: discord.Interaction):
                 log.warning("cleanup delete failed for thread %s: %s", t.id, e)
 
         msg_parts = [f"🗑️ {deleted}개의 고아 thread를 삭제했습니다."]
+        if zombies_cleaned:
+            msg_parts.append(f"🧟 좀비 세션 {zombies_cleaned}개의 registry 상태를 정리했습니다.")
         if errors:
             msg_parts.append(f"⚠️ 실패 {len(errors)}개: " + ", ".join(errors[:3]))
         await inter.followup.send("\n".join(msg_parts), ephemeral=True)
@@ -642,9 +691,11 @@ async def cleanup_cmd(interaction: discord.Interaction):
     select.callback = on_select
     view = discord.ui.View(timeout=120)
     view.add_item(select)
-    await interaction.followup.send(
-        f"**{len(orphan_threads)}개의 고아 thread**를 발견했습니다. 삭제할 thread를 선택하세요:",
-        view=view, ephemeral=True)
+    summary = f"**{len(orphan_threads)}개의 고아 thread** 발견 (좀비 {len(zombie_ids)} + 미등록 {len(unregistered_ids)})."
+    if not cmux_ok:
+        summary += "\n⚠️ cmux 응답 없음 — 좀비 탐지는 건너뜀."
+    await interaction.followup.send(summary + " 삭제할 thread를 선택하세요:",
+                                     view=view, ephemeral=True)
 
 
 @tree.command(name="rebind", description="현재 세션을 새 Discord thread로 옮깁니다")
