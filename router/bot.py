@@ -46,7 +46,7 @@ class WireSession:
         self.relay: Optional[ThreadRelay] = None
 
     async def start_relay(self, thread: discord.Thread, client: discord.Client):
-        self.relay = ThreadRelay(thread, show_thoughts=False, show_tool_progress=True)
+        self.relay = ThreadRelay(thread, show_thoughts=False, show_tool_progress=False)
         # Tail is started lazily when first message triggers wire.jsonl creation
         return self.relay
 

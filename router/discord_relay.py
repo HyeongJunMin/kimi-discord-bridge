@@ -59,7 +59,7 @@ class ThreadRelay:
     """Owns one Discord thread; tails wire.jsonl and flushes text via debounce."""
 
     def __init__(self, thread: "discord.Thread", *, show_thoughts: bool = False,
-                 show_tool_progress: bool = True):
+                 show_tool_progress: bool = False):
         self.thread = thread
         self.show_thoughts = show_thoughts
         self.show_tool_progress = show_tool_progress
