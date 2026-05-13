@@ -14,6 +14,8 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 - 스레드에 메시지를 보내면 로컬 kimi-cli로 전달되고, kimi의 응답이 스레드에 스트리밍됨
 - 같은 kimi 세션을 PC 앞 cmux 터미널과 Discord 양쪽에서 동시에 볼 수 있음
 
+> 이 봇을 왜 직접 만들었는지 (Claude Code Channels / kimi-cli 메신저 통합과의 비교, 운영상 발견한 한계) 는 [docs/WHY.md](docs/WHY.md) 참고.
+
 ## 주요 기능
 
 ### 슬래시 명령
@@ -70,6 +72,7 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 ## 개발자용 문서
 
+- [`docs/WHY.md`](docs/WHY.md) — 봇 개발 배경, 기존 도구 (Claude Code Channels, kimi-cli) 와의 비교, 한계 분석
 - [`router/README.md`](router/README.md) — 라우터 내부 구조, 모듈별 책임 설명
 
 ## 라이선스
