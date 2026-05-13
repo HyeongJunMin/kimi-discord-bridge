@@ -303,6 +303,7 @@ launchctl load ~/Library/LaunchAgents/com.kimi-bridge.plist
 | `DEFAULT_WORK_DIR` | | `$HOME` | 새 워크스페이스의 기본 cwd |
 | `CMUX_CMD` | | `cmux` | cmux 바이너리 경로 (PATH에 없을 때만 절대경로 지정) |
 | `SESSION_DB_PATH` | | `router.sqlite3` | 세션 메타데이터 sqlite 파일 |
+| `PREVENT_SLEEP_WHILE_ACTIVE` | | `0` | `1`이면 활성 세션이 있는 동안 `caffeinate -imsu` helper process를 띄워 잠금/화면 꺼짐 상태에서 system sleep 진입을 방지 |
 
 ---
 

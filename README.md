@@ -37,8 +37,24 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 - **이미지 첨부 자동 전달** — 스레드에 png/jpg/jpeg/webp/gif 이미지를 올리면 봇이 `/tmp/kimi-uploads/<thread_id>/` 에 저장한 뒤 `@<absolute path>` 형태로 메시지에 끼워 kimi에 전달. 한 장당 10 MiB 상한. 세션 종료 시 디렉터리 정리.
 - **cmux 탭 이름 자동 설정** — `/new`, `/attach`, `/rebind` 시 cmux surface 탭이 `<workspace 앞 3글자>-<thread 끝 4자리>` 형식으로 자동 명명. 여러 세션이 떠있을 때 PC 화면에서 식별 용이.
+- **잠금 상태 유지 지원** — `PREVENT_SLEEP_WHILE_ACTIVE=1` 이면 활성 세션이 있는 동안 브릿지가 `caffeinate -imsu` helper process를 실행해 idle/system sleep을 방지합니다. 디스플레이 sleep은 막지 않으므로 잠금 화면이나 화면 꺼짐 상태는 그대로 사용할 수 있습니다.
+- **메시지 유실 방지 queue** — Discord에서 받은 사용자 메시지는 먼저 로컬 SQLite 파일(`router.sqlite3`, `SESSION_DB_PATH`로 변경 가능)에 `pending` 상태로 저장한 뒤 cmux/kimi에 전달합니다. cmux RPC가 일시적으로 timeout 되면 메시지는 pending으로 남고 worker가 재시도합니다.
 - **스레드 자동 보관 대응** — Discord가 스레드를 자동으로 archive하면 세션이 종료되고 cmux surface도 정리됨. 보관 해제 시 봇이 복구 방법(`/attach` 또는 `/new`)을 안내.
 - **봇 재시작 시 세션 보존** — 봇이 종료되어도 cmux surface는 살려둠. 재시작 후 동일 스레드에서 `/attach`로 재연결 가능.
+
+## 전원 상태 지원 범위
+
+지원:
+- 화면 잠금
+- 디스플레이 꺼짐
+- Mac이 깨어 있고 bridge/cmux/kimi-cli 프로세스가 살아 있는 상태
+
+미지원:
+- 실제 system sleep
+- 뚜껑 닫힘으로 강제 sleep된 상태
+- 전원 꺼짐 또는 네트워크 단절
+
+실제 system sleep 중에는 로컬 프로세스가 실행되지 않으므로 Discord 메시지를 실시간으로 처리할 수 없습니다. 잠금 상태에서 원격 작업을 계속하려면 `PREVENT_SLEEP_WHILE_ACTIVE=1` 을 켜고, 뚜껑은 열어두거나 클램쉘처럼 Mac이 깨어 있는 구성을 사용하세요.
 
 ## 사전 요구사항
 
@@ -66,6 +82,7 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 - `/new`를 눌렀는데 응답이 없음 → 봇 인스턴스가 여러 개 떠 있는지 확인 (같은 토큰 공유 시 interaction 충돌)
 - `cmux 호출 실패` → cmux.app이 떠 있지 않음. Discord에서 `/cmux-run` 호출 또는 직접 cmux.app 실행
+- 메시지를 보냈는데 kimi에 늦게 들어감 → `/status`에서 `queue: pending=N` 과 `last_error` 확인. cmux timeout 등 일시 장애면 pending 메시지가 보존되고 worker가 재시도함.
 - 첫 메시지 응답이 안 옴 → 봇이 wire.jsonl을 못 찾는 상황. 60초 기다리면 에러 메시지가 뜨고, 두 번째 메시지부터 정상화됨 (한 번 보낸 첫 메시지는 cmux 화면에서 확인 가능)
 - `/attach`가 "연결할 수 있는 kimi surface를 찾지 못했어요"라고 응답 (분명히 surface가 떠 있는데) → 봇 재시작 직후 흔한 케이스. registry에 `status='active'`인 좀비 row가 남아있어 후보에서 제외됨. 같은 스레드에서 다시 `/attach`로 재연결되거나, 텍스트 채널에서 `/cleanup`으로 좀비 정리.
 - 이미지 첨부를 올렸는데 kimi가 못 읽음 → 봇 로그의 `rejection` 라인 확인. 확장자(`.png/.jpg/.jpeg/.webp/.gif`)와 10 MiB 상한 체크.

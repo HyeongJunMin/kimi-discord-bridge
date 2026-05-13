@@ -107,3 +107,51 @@ def test_persistence_across_reopens(tmp_sqlite_path):
     Registry(tmp_sqlite_path).insert(_row(thread_id="t-persist"))
     got = Registry(tmp_sqlite_path).get_by_thread("t-persist")
     assert got is not None
+
+
+def test_enqueue_and_list_pending_messages(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello")
+
+    pending = reg.list_pending_messages(limit=10)
+    assert [m.id for m in pending] == [msg_id]
+    assert pending[0].content == "hello"
+    assert pending[0].status == "pending"
+
+
+def test_mark_message_delivered_removes_from_pending(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello")
+
+    reg.mark_message_delivered(msg_id)
+
+    assert reg.list_pending_messages(limit=10) == []
+    assert reg.count_pending_messages("t1") == 0
+
+
+def test_mark_message_failed_keeps_transient_failures_pending(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello")
+
+    reg.mark_message_failed(msg_id, "cmux timeout")
+
+    assert reg.count_pending_messages("t1") == 1
+    assert reg.last_delivery_error("t1") == "cmux timeout"
+    # Backoff hides the row until next_attempt_at.
+    assert reg.list_pending_messages(limit=10) == []
+
+
+def test_fail_pending_for_thread_terminally_fails_messages(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    reg.enqueue_message(thread_id="t1", author_user_id="u1", content="a")
+    reg.enqueue_message(thread_id="t2", author_user_id="u1", content="b")
+
+    reg.fail_pending_for_thread("t1", "session ended")
+
+    assert reg.count_pending_messages("t1") == 0
+    assert reg.count_pending_messages("t2") == 1
+    assert reg.last_delivery_error("t1") == "session ended"

@@ -200,6 +200,74 @@ async def test_send_to_surface_strips_embedded_paste_escape_smuggling():
     assert sent.endswith("after\x1b[201~\r")
 
 
+def _session_row_for_queue(thread_id: str = "123") -> bot.SessionRow:
+    return bot.SessionRow(
+        thread_id=thread_id,
+        guild_id="g",
+        channel_id="c",
+        owner_user_id="7",
+        workspace_id="ws",
+        workspace_name="ws",
+        cwd="/tmp",
+        monitor_surface_id="surf-1",
+        acp_session_id="sess-1",
+        status="active",
+        created_at=0,
+        last_active_at=0,
+    )
+
+
+async def test_relay_user_message_queues_then_delivers_when_worker_stopped(
+    tmp_sqlite_path, monkeypatch
+):
+    """A Discord message is persisted before it is delivered to cmux."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123"))
+    sess = bot.WireSession(
+        thread_id=123, surface_id="surf-1", session_uuid="sess-1",
+        cwd="/tmp", owner_id=7)
+    relay = MagicMock()
+    relay._tail_started = True
+    relay.reset_message_anchor = MagicMock()
+    sess.relay = relay
+    router.sessions[123] = sess
+
+    send_mock = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=send_mock):
+        msg_id = await router.relay_user_message(
+            123, "queued hello", MagicMock(), author_user_id=7)
+
+    assert msg_id > 0
+    assert router.registry.count_pending_messages("123") == 0
+    send_mock.assert_awaited_once()
+
+
+async def test_relay_user_message_keeps_pending_on_cmux_failure(
+    tmp_sqlite_path, monkeypatch
+):
+    """cmux failure leaves the message in SQLite for a later retry."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123"))
+    sess = bot.WireSession(
+        thread_id=123, surface_id="surf-1", session_uuid="sess-1",
+        cwd="/tmp", owner_id=7)
+    relay = MagicMock()
+    relay._tail_started = True
+    sess.relay = relay
+    router.sessions[123] = sess
+
+    with patch.object(
+        bot, "surface_send_text", new=AsyncMock(side_effect=CmuxError("timeout"))
+    ):
+        await router.relay_user_message(
+            123, "do not lose me", MagicMock(), author_user_id=7)
+
+    assert router.registry.count_pending_messages("123") == 1
+    assert router.registry.last_delivery_error("123") == "timeout"
+
+
 # ── create_session renames cmux tab to thread name ────────────────────────
 
 async def test_create_session_renames_cmux_tab_with_short_title(monkeypatch):

@@ -27,6 +27,7 @@ from .discord_relay import (
     ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl,
     find_live_kimi_surface_ids,
 )
+from .sleep_guard import SleepGuard
 
 log = logging.getLogger("router.bot")
 logging.basicConfig(level=logging.INFO,
@@ -35,6 +36,10 @@ logging.basicConfig(level=logging.INFO,
 REGISTRY_PATH = os.environ.get("SESSION_DB_PATH", "router.sqlite3")
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.environ.get("DISCORD_GUILD_ID") else None
 DEFAULT_WORK_DIR = os.environ.get("DEFAULT_WORK_DIR", os.path.expanduser("~"))
+PREVENT_SLEEP_WHILE_ACTIVE = (
+    os.environ.get("PREVENT_SLEEP_WHILE_ACTIVE", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -103,6 +108,87 @@ class Router:
     def __init__(self):
         self.registry = Registry(REGISTRY_PATH)
         self.sessions: dict[int, WireSession] = {}   # thread_id → WireSession
+        self.sleep_guard = SleepGuard(enabled=PREVENT_SLEEP_WHILE_ACTIVE)
+        self._delivery_task: asyncio.Task | None = None
+        self._delivery_wakeup: asyncio.Event | None = None
+        self._delivery_lock = asyncio.Lock()
+
+    async def refresh_sleep_guard(self) -> None:
+        await self.sleep_guard.refresh(len(self.sessions))
+
+    def start_delivery_worker(self, client: discord.Client) -> None:
+        if self._delivery_task and not self._delivery_task.done():
+            return
+        self._delivery_wakeup = asyncio.Event()
+        self._delivery_task = asyncio.create_task(
+            self._delivery_worker(client),
+            name="inbound-message-delivery",
+        )
+
+    async def stop_delivery_worker(self) -> None:
+        task = self._delivery_task
+        self._delivery_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def wake_delivery_worker(self) -> None:
+        if self._delivery_wakeup:
+            self._delivery_wakeup.set()
+
+    async def _delivery_worker(self, client: discord.Client) -> None:
+        while True:
+            try:
+                await self.deliver_pending_once(client)
+                if self._delivery_wakeup:
+                    self._delivery_wakeup.clear()
+                    await asyncio.wait_for(self._delivery_wakeup.wait(), timeout=1.0)
+                else:
+                    await asyncio.sleep(1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("delivery worker iteration failed")
+                await asyncio.sleep(1.0)
+
+    async def deliver_pending_once(self, client: discord.Client, *,
+                                   limit: int = 20) -> int:
+        delivered = 0
+        async with self._delivery_lock:
+            for item in self.registry.list_pending_messages(limit=limit):
+                row = self.registry.get_by_thread(item.thread_id)
+                if not row or row.status != "active":
+                    self.registry.mark_message_failed(
+                        item.id, "session is not active", terminal=True)
+                    continue
+                try:
+                    thread_id = int(item.thread_id)
+                except ValueError:
+                    self.registry.mark_message_failed(
+                        item.id, "invalid thread id", terminal=True)
+                    continue
+                sess = self.sessions.get(thread_id)
+                if not sess:
+                    self.registry.mark_message_failed(
+                        item.id, "session is active but not loaded in memory")
+                    continue
+                try:
+                    log.info("Deliver queued Discord message: id=%s thread=%s",
+                             item.id, item.thread_id)
+                    await sess.send_to_surface(item.content, client)
+                    self.registry.mark_message_delivered(item.id)
+                    self.registry.touch(item.thread_id)
+                    delivered += 1
+                except Exception as e:
+                    log.warning("queued delivery failed for id=%s: %s",
+                                item.id, e)
+                    self.registry.mark_message_failed(item.id, str(e))
+        return delivered
 
     async def create_session(self, *, thread: discord.Thread, owner_id: int,
                              workspace_id: str, workspace_name: str | None,
@@ -162,6 +248,7 @@ class Router:
             created_at=int(time.time()),
             last_active_at=int(time.time()),
         ))
+        await self.refresh_sleep_guard()
         return sess, surface_info
 
     async def _wait_for_session_uuid(self, surface_id: str, timeout: float = 25.0) -> str | None:
@@ -176,22 +263,31 @@ class Router:
         return None
 
     async def relay_user_message(self, thread_id: int, text: str,
-                                 client: discord.Client) -> None:
-        sess = self.sessions.get(thread_id)
-        if not sess:
-            return
-        log.info("Discord → Surface: thread=%s text=%r", thread_id, text)
-        await sess.send_to_surface(text, client)
+                                 client: discord.Client,
+                                 *, author_user_id: int) -> int:
+        log.info("Discord → Queue: thread=%s text=%r", thread_id, text)
+        message_id = self.registry.enqueue_message(
+            thread_id=str(thread_id),
+            author_user_id=str(author_user_id),
+            content=text,
+        )
         self.registry.touch(str(thread_id))
+        self.wake_delivery_worker()
+        # In tests and during early startup the worker may not be running yet.
+        if not self._delivery_task or self._delivery_task.done():
+            await self.deliver_pending_once(client)
+        return message_id
 
     async def shutdown_session(self, thread_id: int) -> None:
         sess = self.sessions.pop(thread_id, None)
         if sess:
             await sess.stop()
+        self.registry.fail_pending_for_thread(str(thread_id), "session ended")
         self.registry.update_status(str(thread_id), "dead")
         # Clean up any per-thread image uploads. macOS would clean /tmp
         # eventually but we want explicit cleanup so /kill is deterministic.
         _delete_upload_dir(thread_id)
+        await self.refresh_sleep_guard()
 
 
 # ── Discord bot setup ─────────────────────────────────────────────────────────
@@ -491,6 +587,21 @@ async def status_cmd(interaction: discord.Interaction):
         return
     sess = router.sessions.get(interaction.channel.id)
     tail_status = "running" if (sess and sess.relay and sess.relay._tail_started) else "not started"
+    guard_status = router.sleep_guard.status()
+    pending_count = router.registry.count_pending_messages(str(interaction.channel.id))
+    last_error = router.registry.last_delivery_error(str(interaction.channel.id)) or "-"
+    worker_status = (
+        "running"
+        if router._delivery_task and not router._delivery_task.done()
+        else "stopped"
+    )
+    cmux_status = "unknown"
+    if row.monitor_surface_id:
+        try:
+            await surface_read_text(row.monitor_surface_id)
+            cmux_status = "ok"
+        except CmuxError as e:
+            cmux_status = f"error: {e}"
     msg = (
         f"**세션 상태**\n"
         f"```\n"
@@ -500,6 +611,10 @@ async def status_cmd(interaction: discord.Interaction):
         f"workspace:  {row.workspace_name or row.workspace_id}\n"
         f"status:     {row.status}\n"
         f"tail:       {tail_status}\n"
+        f"cmux:       {cmux_status}\n"
+        f"queue:      pending={pending_count} worker={worker_status}\n"
+        f"sleep:      enabled={guard_status.enabled} active={guard_status.active} pid={guard_status.pid or '-'}\n"
+        f"last_error: {last_error}\n"
         f"```"
     )
     await interaction.response.send_message(msg, ephemeral=True)
@@ -887,6 +1002,7 @@ async def attach_cmd(interaction: discord.Interaction):
             created_at=int(time.time()),
             last_active_at=int(time.time()),
         ))
+        await router.refresh_sleep_guard()
 
         await thread.send(
             f"준비 완료. 메시지를 보내면 kimi에 전달됩니다.\n"
@@ -1265,7 +1381,8 @@ async def on_message(msg: discord.Message):
             return
 
     payload = _compose_message_with_attachments(msg.content, saved_paths)
-    await router.relay_user_message(msg.channel.id, payload, client)
+    await router.relay_user_message(
+        msg.channel.id, payload, client, author_user_id=msg.author.id)
 
 
 @client.event
@@ -1307,6 +1424,8 @@ async def on_ready():
         except Exception as e:
             log.error("command sync failed: %s", e)
     log.info("bot online: %s", client.user)
+    router.start_delivery_worker(client)
+    await router.refresh_sleep_guard()
 
 
 async def _shutdown() -> None:
@@ -1324,6 +1443,8 @@ async def _shutdown() -> None:
     if router.sessions:
         log.info("shutdown: leaving %d cmux session(s) alive for later /attach",
                  len(router.sessions))
+    await router.stop_delivery_worker()
+    await router.sleep_guard.stop()
     # Stop in-process relays (cancels debounce flush tasks) without touching
     # the cmux surface itself.
     for sess in list(router.sessions.values()):
