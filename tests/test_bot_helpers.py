@@ -384,6 +384,76 @@ async def test_relay_user_message_falls_back_to_wire_on_cmux_failure(
     relay.stop.assert_awaited_once()
 
 
+async def test_restore_wire_session_creates_cmux_surface_and_resumes_session(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue(
+        "123",
+        backend="wire",
+        monitor_surface_id=None,
+        abandoned_surface_id="surf-old",
+    ))
+
+    wire_sess = MagicMock()
+    wire_sess.active_turn = False
+    wire_sess.close = AsyncMock()
+    router.wire_sessions[123] = wire_sess
+
+    thread = MagicMock()
+    thread.id = 123
+    thread.name = "kimi-kimi-hub-7777"
+    thread.send = AsyncMock()
+    client = MagicMock()
+    client.get_channel.return_value = thread
+
+    send_mock = AsyncMock()
+    with patch.object(
+        bot, "create_surface", new=AsyncMock(return_value={"surface_id": "surf-new"})
+    ), patch.object(
+        bot, "surface_read_text", new=AsyncMock(return_value="$")
+    ), patch.object(
+        bot, "surface_send_text", new=send_mock
+    ), patch.object(
+        bot, "rename_tab", new=AsyncMock()
+    ):
+        restored = await router.restore_wire_sessions_once(client)
+
+    assert restored == 1
+    row = router.registry.get_by_thread("123")
+    assert row.backend == "cmux"
+    assert row.monitor_surface_id == "surf-new"
+    assert row.abandoned_surface_id == "surf-old"
+    assert 123 in router.sessions
+    assert 123 not in router.wire_sessions
+    wire_sess.close.assert_awaited_once()
+    sent_cmd = send_mock.await_args.args[1]
+    assert "kimi --session sess-1" in sent_cmd
+    assert "cd /tmp" in sent_cmd
+    thread.send.assert_awaited_once()
+
+
+async def test_restore_wire_session_skips_active_turn(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123", backend="wire"))
+
+    wire_sess = MagicMock()
+    wire_sess.active_turn = True
+    router.wire_sessions[123] = wire_sess
+    client = MagicMock()
+
+    with patch.object(bot, "create_surface", new=AsyncMock()) as create_mock:
+        restored = await router.restore_wire_sessions_once(client)
+
+    assert restored == 0
+    create_mock.assert_not_awaited()
+    assert router.registry.get_by_thread("123").backend == "wire"
+
+
 async def test_relay_user_message_skips_stale_messages(
     tmp_sqlite_path, monkeypatch
 ):

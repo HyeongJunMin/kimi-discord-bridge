@@ -3,7 +3,7 @@
 Replaces ACP with cmux surface + wire.jsonl tail.
 """
 from __future__ import annotations
-import asyncio, logging, os, signal, sqlite3, time
+import asyncio, logging, os, signal, shlex, sqlite3, time
 import inspect
 from pathlib import Path
 from typing import Optional
@@ -79,6 +79,8 @@ def _nonnegative_int_env(name: str, default: int) -> int:
 
 QUEUE_MAX_MESSAGE_AGE_SEC = _nonnegative_int_env(
     "QUEUE_MAX_MESSAGE_AGE_SEC", 300)
+RESTORE_WATCH_INTERVAL_SEC = _nonnegative_int_env(
+    "RESTORE_WATCH_INTERVAL_SEC", 5)
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -152,8 +154,10 @@ class Router:
         self.sleep_guard_mode = SLEEP_GUARD_MODE
         self.sleep_guard = SleepGuard(enabled=self.sleep_guard_mode != "off")
         self._delivery_task: asyncio.Task | None = None
+        self._restore_task: asyncio.Task | None = None
         self._delivery_wakeup: asyncio.Event | None = None
         self._delivery_lock = asyncio.Lock()
+        self._restore_lock = asyncio.Lock()
 
     async def refresh_sleep_guard(self) -> None:
         if self.sleep_guard_mode == "always":
@@ -181,6 +185,129 @@ class Router:
                 await task
             except asyncio.CancelledError:
                 pass
+
+    def start_restore_worker(self, client: discord.Client) -> None:
+        if self._restore_task and not self._restore_task.done():
+            return
+        self._restore_task = asyncio.create_task(
+            self._restore_worker(client),
+            name="wire-to-cmux-restore",
+        )
+
+    async def stop_restore_worker(self) -> None:
+        task = self._restore_task
+        self._restore_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _restore_worker(self, client: discord.Client) -> None:
+        while True:
+            try:
+                await self.restore_wire_sessions_once(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("restore worker iteration failed")
+            await asyncio.sleep(max(1, RESTORE_WATCH_INTERVAL_SEC))
+
+    async def restore_wire_sessions_once(self, client: discord.Client) -> int:
+        restored = 0
+        async with self._restore_lock:
+            for row in self.registry.list_active():
+                if row.backend != "wire" or not row.acp_session_id:
+                    continue
+                thread_id = int(row.thread_id)
+                wire_sess = self.wire_sessions.get(thread_id)
+                if wire_sess and wire_sess.active_turn:
+                    continue
+                try:
+                    if await self._restore_one_wire_session(row, client):
+                        restored += 1
+                except Exception as e:
+                    log.warning("restore failed for thread=%s: %s", row.thread_id, e)
+                    self.registry.set_backend(
+                        row.thread_id,
+                        "wire",
+                        surface_id=None,
+                        abandoned_surface_id=row.abandoned_surface_id,
+                        last_error=str(e),
+                        restore_attempt_at=int(time.time()),
+                    )
+        return restored
+
+    async def _restore_one_wire_session(self, row: SessionRow,
+                                        client: discord.Client) -> bool:
+        thread_id = int(row.thread_id)
+        thread = await self._fetch_thread(client, thread_id)
+        self.registry.set_backend(
+            row.thread_id,
+            "restoring",
+            surface_id=None,
+            abandoned_surface_id=row.abandoned_surface_id,
+            restore_attempt_at=int(time.time()),
+        )
+        surface_info = await create_surface(row.workspace_id, focus=False)
+        surf_id = ((surface_info or {}).get("surface_id")
+                   or (surface_info or {}).get("id"))
+        if not surf_id:
+            raise RuntimeError("cmux restore created no surface id")
+        try:
+            await rename_tab(surf_id, _short_tab_title(row.workspace_name, thread.name))
+        except Exception as e:
+            log.warning("restore rename_tab failed: %s", e)
+        await self._wait_for_surface_ready(surf_id)
+        cmd = (
+            f"cd {shlex.quote(row.cwd)} && "
+            f"KIMI_CLI_NO_AUTO_UPDATE=1 kimi --session "
+            f"{shlex.quote(row.acp_session_id)}\n"
+        )
+        await surface_send_text(surf_id, cmd)
+        cmux_sess = WireSession(
+            thread_id=thread_id,
+            surface_id=surf_id,
+            session_uuid=row.acp_session_id,
+            cwd=row.cwd,
+            owner_id=int(row.owner_user_id),
+        )
+        await cmux_sess.start_relay(thread, client)
+        self.sessions[thread_id] = cmux_sess
+        self.registry.set_backend(
+            row.thread_id,
+            "cmux",
+            surface_id=surf_id,
+            abandoned_surface_id=row.abandoned_surface_id,
+        )
+        wire_sess = self.wire_sessions.pop(thread_id, None)
+        if wire_sess:
+            try:
+                await wire_sess.close()
+            except Exception as e:
+                log.warning("wire close after restore failed: %s", e)
+        await self.refresh_sleep_guard()
+        try:
+            await thread.send(
+                "cmux 복구 완료: 같은 Kimi session을 cmux surface에서 다시 열었습니다."
+            )
+        except Exception:
+            log.exception("restore notice failed for thread %s", row.thread_id)
+        return True
+
+    async def _wait_for_surface_ready(self, surface_id: str,
+                                      timeout: float = 12.0) -> None:
+        deadline = time.time() + timeout
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                await surface_read_text(surface_id)
+                return
+            except CmuxError as e:
+                last_error = e
+                await asyncio.sleep(0.5)
+        raise RuntimeError(f"cmux surface not ready: {last_error}")
 
     def wake_delivery_worker(self) -> None:
         if self._delivery_wakeup:
@@ -786,7 +913,7 @@ async def list_cmd(interaction: discord.Interaction):
         thread = client.get_channel(int(r.thread_id))
         thread_link = thread.mention if thread else f"thread:{r.thread_id}"
         lines.append(
-            f"• {thread_link} — `{r.acp_session_id[:8]}…` · `{r.cwd[:30]}`"
+            f"• {thread_link} — `{r.acp_session_id[:8]}…` · `{r.backend}` · `{r.cwd[:30]}`"
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -821,7 +948,9 @@ async def status_cmd(interaction: discord.Interaction):
         f"**세션 상태**\n"
         f"```\n"
         f"session_id: {row.acp_session_id}\n"
+        f"backend:    {row.backend}\n"
         f"surface_id: {row.monitor_surface_id}\n"
+        f"abandoned:  {row.abandoned_surface_id or '-'}\n"
         f"cwd:        {row.cwd}\n"
         f"workspace:  {row.workspace_name or row.workspace_id}\n"
         f"status:     {row.status}\n"
@@ -1643,6 +1772,7 @@ async def on_ready():
             log.error("command sync failed: %s", e)
     log.info("bot online: %s", client.user)
     router.start_delivery_worker(client)
+    router.start_restore_worker(client)
     await router.refresh_sleep_guard()
 
 
@@ -1662,6 +1792,7 @@ async def _shutdown() -> None:
         log.info("shutdown: leaving %d cmux session(s) alive for later /attach",
                  len(router.sessions))
     await router.stop_delivery_worker()
+    await router.stop_restore_worker()
     await router.sleep_guard.stop()
     # Stop in-process relays (cancels debounce flush tasks) without touching
     # the cmux surface itself.
@@ -1671,6 +1802,10 @@ async def _shutdown() -> None:
                 await sess.relay.stop()
         except Exception:
             log.exception("relay stop failed for thread %s", sess.thread_id)
+    try:
+        await router.wire_client.stop()
+    except Exception:
+        log.exception("wire helper stop failed")
     try:
         router.registry.conn.close()
     except Exception:
