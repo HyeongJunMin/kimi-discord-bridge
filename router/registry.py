@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     acp_session_id   TEXT,
     status           TEXT NOT NULL,           -- starting|active|dead
     created_at       INTEGER NOT NULL,
-    last_active_at   INTEGER NOT NULL
+    last_active_at   INTEGER NOT NULL,
+    backend          TEXT NOT NULL DEFAULT 'cmux',
+    abandoned_surface_id TEXT,
+    last_backend_error TEXT,
+    restore_attempt_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_acp_session ON sessions(acp_session_id);
@@ -57,6 +61,10 @@ class SessionRow:
     status: str
     created_at: int
     last_active_at: int
+    backend: str = "cmux"
+    abandoned_surface_id: str | None = None
+    last_backend_error: str | None = None
+    restore_attempt_at: int | None = None
 
 
 @dataclass
@@ -81,8 +89,28 @@ class Registry:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate_sessions()
         self._migrate_inbound_messages()
         self.conn.commit()
+
+    def _migrate_sessions(self) -> None:
+        cur = self.conn.execute("PRAGMA table_info(sessions)")
+        columns = {r["name"] for r in cur.fetchall()}
+        if "backend" not in columns:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'cmux'")
+        if "abandoned_surface_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN abandoned_surface_id TEXT")
+        if "last_backend_error" not in columns:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN last_backend_error TEXT")
+        if "restore_attempt_at" not in columns:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN restore_attempt_at INTEGER")
+        self.conn.execute(
+            "UPDATE sessions SET backend='cmux' WHERE backend IS NULL OR backend=''")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_backend ON sessions(backend)")
 
     def _migrate_inbound_messages(self) -> None:
         cur = self.conn.execute("PRAGMA table_info(inbound_messages)")
@@ -102,10 +130,18 @@ class Registry:
         # INSERT OR REPLACE so re-attaching to a thread whose row still
         # exists (e.g. status='dead' from a prior crash) doesn't raise.
         self.conn.execute(
-            """INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT OR REPLACE INTO sessions (
+                   thread_id, guild_id, channel_id, owner_user_id,
+                   workspace_id, workspace_name, cwd, monitor_surface_id,
+                   acp_session_id, status, created_at, last_active_at,
+                   backend, abandoned_surface_id, last_backend_error,
+                   restore_attempt_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (row.thread_id, row.guild_id, row.channel_id, row.owner_user_id,
              row.workspace_id, row.workspace_name, row.cwd, row.monitor_surface_id,
-             row.acp_session_id, row.status, row.created_at, row.last_active_at),
+             row.acp_session_id, row.status, row.created_at, row.last_active_at,
+             row.backend, row.abandoned_surface_id, row.last_backend_error,
+             row.restore_attempt_at),
         )
         self.conn.commit()
 
@@ -136,6 +172,49 @@ class Registry:
         self.conn.execute(
             "UPDATE sessions SET acp_session_id=?, status='active' WHERE thread_id=?",
             (acp_session_id, thread_id),
+        )
+        self.conn.commit()
+
+    def set_backend(self, thread_id: str, backend: str, *,
+                    surface_id: str | None = None,
+                    abandoned_surface_id: str | None = None,
+                    last_error: str | None = None,
+                    restore_attempt_at: int | None = None) -> None:
+        """Update the active delivery backend for a session.
+
+        `backend` is intentionally stored as text instead of an enum so older
+        databases can be migrated in-place and inspected with sqlite tools.
+        The bridge currently uses: cmux, wire, restoring.
+        """
+        if backend not in {"cmux", "wire", "restoring"}:
+            raise ValueError(f"invalid backend: {backend}")
+        self.conn.execute(
+            """UPDATE sessions
+               SET backend=?, monitor_surface_id=?, abandoned_surface_id=?,
+                   last_backend_error=?, restore_attempt_at=?,
+                   last_active_at=?
+               WHERE thread_id=?""",
+            (backend, surface_id, abandoned_surface_id,
+             last_error[:1000] if last_error else None, restore_attempt_at,
+             int(time.time()), thread_id),
+        )
+        self.conn.commit()
+
+    def update_surface(self, thread_id: str, surface_id: str | None) -> None:
+        self.conn.execute(
+            """UPDATE sessions
+               SET monitor_surface_id=?, last_active_at=?
+               WHERE thread_id=?""",
+            (surface_id, int(time.time()), thread_id),
+        )
+        self.conn.commit()
+
+    def set_backend_error(self, thread_id: str, error: str | None) -> None:
+        self.conn.execute(
+            """UPDATE sessions
+               SET last_backend_error=?, last_active_at=?
+               WHERE thread_id=?""",
+            (error[:1000] if error else None, int(time.time()), thread_id),
         )
         self.conn.commit()
 

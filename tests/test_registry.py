@@ -37,6 +37,8 @@ def test_insert_and_get_roundtrip(tmp_sqlite_path):
     assert got.thread_id == "t1"
     assert got.owner_user_id == "u1"
     assert got.status == "active"
+    assert got.backend == "cmux"
+    assert got.abandoned_surface_id is None
 
 
 def test_get_by_thread_missing_returns_none(tmp_sqlite_path):
@@ -101,6 +103,44 @@ def test_set_acp_session_sets_id_and_marks_active(tmp_sqlite_path):
     got = reg.get_by_thread("t1")
     assert got.acp_session_id == "new-acp-uuid"
     assert got.status == "active"
+
+
+def test_set_backend_updates_hybrid_state(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    reg.insert(_row(thread_id="t1", monitor_surface_id="surf-old"))
+
+    reg.set_backend(
+        "t1",
+        "wire",
+        surface_id=None,
+        abandoned_surface_id="surf-old",
+        last_error="Terminal surface not found",
+        restore_attempt_at=123,
+    )
+
+    got = reg.get_by_thread("t1")
+    assert got.backend == "wire"
+    assert got.monitor_surface_id is None
+    assert got.abandoned_surface_id == "surf-old"
+    assert got.last_backend_error == "Terminal surface not found"
+    assert got.restore_attempt_at == 123
+
+
+def test_set_backend_rejects_unknown_backend(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    reg.insert(_row(thread_id="t1"))
+
+    with pytest.raises(ValueError):
+        reg.set_backend("t1", "banana")
+
+
+def test_update_surface_sets_current_surface(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    reg.insert(_row(thread_id="t1", monitor_surface_id=None))
+
+    reg.update_surface("t1", "surf-new")
+
+    assert reg.get_by_thread("t1").monitor_surface_id == "surf-new"
 
 
 def test_persistence_across_reopens(tmp_sqlite_path):
@@ -201,3 +241,38 @@ def test_registry_migrates_existing_inbound_message_table(tmp_sqlite_path):
     pending = reg.list_pending_messages(limit=10, now=111)
     assert pending[0].source_created_at == 111
     assert pending[0].discord_message_id is None
+
+
+def test_registry_migrates_existing_sessions_table(tmp_sqlite_path):
+    conn = sqlite3.connect(tmp_sqlite_path)
+    conn.execute(
+        """CREATE TABLE sessions (
+            thread_id TEXT PRIMARY KEY,
+            guild_id TEXT,
+            channel_id TEXT,
+            owner_user_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            workspace_name TEXT,
+            cwd TEXT NOT NULL,
+            monitor_surface_id TEXT,
+            acp_session_id TEXT,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_active_at INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO sessions
+           VALUES ('t1', 'g', 'c', 'u', 'w', 'ws', '/tmp',
+                   'surf-1', 'sess-1', 'active', 1, 2)"""
+    )
+    conn.commit()
+    conn.close()
+
+    reg = Registry(tmp_sqlite_path)
+
+    got = reg.get_by_thread("t1")
+    assert got.backend == "cmux"
+    assert got.abandoned_surface_id is None
+    assert got.last_backend_error is None
+    assert got.restore_attempt_at is None
