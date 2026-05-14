@@ -694,8 +694,8 @@ async def status_cmd(interaction: discord.Interaction):
         f"status:     {row.status}\n"
         f"tail:       {tail_status}\n"
         f"cmux:       {cmux_status}\n"
-        f"queue:      pending={pending_count} worker={worker_status}\n"
-        f"sleep:      enabled={guard_status.enabled} active={guard_status.active} pid={guard_status.pid or '-'}\n"
+        f"queue:      pending={pending_count} worker={worker_status} max_age={QUEUE_MAX_MESSAGE_AGE_SEC}s\n"
+        f"sleep:      mode={router.sleep_guard_mode} active={guard_status.active} pid={guard_status.pid or '-'}\n"
         f"last_error: {last_error}\n"
         f"```"
     )

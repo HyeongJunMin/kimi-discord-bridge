@@ -303,7 +303,9 @@ launchctl load ~/Library/LaunchAgents/com.kimi-bridge.plist
 | `DEFAULT_WORK_DIR` | | `$HOME` | 새 워크스페이스의 기본 cwd |
 | `CMUX_CMD` | | `cmux` | cmux 바이너리 경로 (PATH에 없을 때만 절대경로 지정) |
 | `SESSION_DB_PATH` | | `router.sqlite3` | 세션 메타데이터 sqlite 파일 |
-| `PREVENT_SLEEP_WHILE_ACTIVE` | | `0` | `1`이면 활성 세션이 있는 동안 `caffeinate -imsu` helper process를 띄워 잠금/화면 꺼짐 상태에서 system sleep 진입을 방지 |
+| `SLEEP_GUARD_MODE` | | `off` | `off`, `active_sessions`, `always`. `always`는 브릿지 실행 중 항상 `caffeinate -imsu`를 유지해 외부 `/new` 대기 상태에 적합 |
+| `QUEUE_MAX_MESSAGE_AGE_SEC` | | `300` | Discord 원본 작성 시각 기준 이 값보다 오래된 메시지는 wake 후 자동 실행하지 않고 `skipped_stale` 처리. `0`이면 비활성 |
+| `PREVENT_SLEEP_WHILE_ACTIVE` | | `0` | 기존 호환용. `SLEEP_GUARD_MODE`가 없고 이 값이 `1`이면 `active_sessions`로 해석 |
 
 ---
 

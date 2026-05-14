@@ -10,7 +10,7 @@ so authentication uses `MOONSHOT_API_KEY` only.
 - `auth_bypass/`      — PYTHONPATH'd sitecustomize patch (no global mutation)
 - `cmux_client.py`    — `cmux rpc` wrapper for workspace.* / surface.*
 - `registry.py`       — sqlite session table (thread_id ↔ acp session)
-- `sleep_guard.py`    — optional `caffeinate -imsu` helper while sessions are active
+- `sleep_guard.py`    — optional `caffeinate -imsu` helper (`off`/`active_sessions`/`always`)
 - `discord_relay.py`  — per-thread debounce + edit-roll-over output
 - `bot.py`            — entry point: `/new`, message routing, permission buttons
 
@@ -46,7 +46,8 @@ python -m router.bot
 - 이미지 첨부 자동 전달 (`png/jpg/jpeg/webp/gif`, 한 장 ≤10 MiB → `@<abspath>` 로 kimi 에 패스)
 - 봇 종료 시 cmux surface 보존 + 재시작 후 `/attach` 로 재연결 (restart recovery)
 - Discord 메시지 durable queue (SQLite `inbound_messages`) + worker 재시도
-- 활성 세션 동안 macOS idle/system sleep 방지 (`PREVENT_SLEEP_WHILE_ACTIVE=1`)
+- macOS idle/system sleep 방지 (`SLEEP_GUARD_MODE=active_sessions|always`)
+- wake 후 오래된 Discord 메시지 자동 실행 차단 (`QUEUE_MAX_MESSAGE_AGE_SEC`)
 - /yolo 슬래시 명령 (availableCommands 발견 없이 직접 ESC seq 전송)
 - cmux 탭 이름 자동 명명 (`<workspace[:3]>-<thread_id 끝 4자리>`)
 
