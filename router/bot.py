@@ -218,7 +218,7 @@ class Router:
         restored = 0
         async with self._restore_lock:
             for row in self.registry.list_active():
-                if row.backend != "wire" or not row.acp_session_id:
+                if row.backend not in {"wire", "restoring"} or not row.acp_session_id:
                     continue
                 thread_id = int(row.thread_id)
                 wire_sess = self.wire_sessions.get(thread_id)

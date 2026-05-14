@@ -454,6 +454,20 @@ async def test_restore_wire_session_skips_active_turn(
     assert router.registry.get_by_thread("123").backend == "wire"
 
 
+async def test_restore_worker_retries_rows_left_in_restoring_state(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123", backend="restoring"))
+    router._restore_one_wire_session = AsyncMock(return_value=True)
+
+    restored = await router.restore_wire_sessions_once(MagicMock())
+
+    assert restored == 1
+    router._restore_one_wire_session.assert_awaited_once()
+
+
 async def test_relay_user_message_skips_stale_messages(
     tmp_sqlite_path, monkeypatch
 ):
