@@ -36,10 +36,28 @@ logging.basicConfig(level=logging.INFO,
 REGISTRY_PATH = os.environ.get("SESSION_DB_PATH", "router.sqlite3")
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.environ.get("DISCORD_GUILD_ID") else None
 DEFAULT_WORK_DIR = os.environ.get("DEFAULT_WORK_DIR", os.path.expanduser("~"))
-PREVENT_SLEEP_WHILE_ACTIVE = (
-    os.environ.get("PREVENT_SLEEP_WHILE_ACTIVE", "0").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
+SLEEP_GUARD_MODES = {"off", "active_sessions", "always"}
+
+
+def _truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sleep_guard_mode_from_env(env: dict[str, str] = os.environ) -> str:
+    """Resolve sleep guard policy, preserving the legacy boolean env var."""
+    mode = env.get("SLEEP_GUARD_MODE")
+    if mode is not None:
+        normalized = mode.strip().lower()
+        if normalized in SLEEP_GUARD_MODES:
+            return normalized
+        log.warning("invalid SLEEP_GUARD_MODE=%r; falling back to off", mode)
+        return "off"
+    if _truthy_env(env.get("PREVENT_SLEEP_WHILE_ACTIVE")):
+        return "active_sessions"
+    return "off"
+
+
+SLEEP_GUARD_MODE = _sleep_guard_mode_from_env()
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -108,13 +126,19 @@ class Router:
     def __init__(self):
         self.registry = Registry(REGISTRY_PATH)
         self.sessions: dict[int, WireSession] = {}   # thread_id → WireSession
-        self.sleep_guard = SleepGuard(enabled=PREVENT_SLEEP_WHILE_ACTIVE)
+        self.sleep_guard_mode = SLEEP_GUARD_MODE
+        self.sleep_guard = SleepGuard(enabled=self.sleep_guard_mode != "off")
         self._delivery_task: asyncio.Task | None = None
         self._delivery_wakeup: asyncio.Event | None = None
         self._delivery_lock = asyncio.Lock()
 
     async def refresh_sleep_guard(self) -> None:
-        await self.sleep_guard.refresh(len(self.sessions))
+        if self.sleep_guard_mode == "always":
+            await self.sleep_guard.start()
+        elif self.sleep_guard_mode == "active_sessions":
+            await self.sleep_guard.refresh(len(self.sessions))
+        else:
+            await self.sleep_guard.stop()
 
     def start_delivery_worker(self, client: discord.Client) -> None:
         if self._delivery_task and not self._delivery_task.done():

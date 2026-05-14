@@ -84,6 +84,75 @@ async def test_kill_thread_name_is_captured_before_delete():
     assert name == "will-be-gone"
 
 
+# ── sleep guard mode parsing / routing ────────────────────────────────────
+
+def test_sleep_guard_mode_defaults_to_off():
+    assert bot._sleep_guard_mode_from_env({}) == "off"
+
+
+def test_sleep_guard_mode_accepts_explicit_modes():
+    assert bot._sleep_guard_mode_from_env({"SLEEP_GUARD_MODE": "always"}) == "always"
+    assert (
+        bot._sleep_guard_mode_from_env({"SLEEP_GUARD_MODE": "active_sessions"})
+        == "active_sessions"
+    )
+    assert bot._sleep_guard_mode_from_env({"SLEEP_GUARD_MODE": "off"}) == "off"
+
+
+def test_sleep_guard_mode_legacy_env_maps_to_active_sessions():
+    assert (
+        bot._sleep_guard_mode_from_env({"PREVENT_SLEEP_WHILE_ACTIVE": "1"})
+        == "active_sessions"
+    )
+
+
+def test_sleep_guard_mode_invalid_value_falls_back_to_off():
+    assert bot._sleep_guard_mode_from_env({"SLEEP_GUARD_MODE": "banana"}) == "off"
+
+
+async def test_refresh_sleep_guard_always_starts_with_zero_sessions(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    monkeypatch.setattr(bot, "SLEEP_GUARD_MODE", "always")
+    router = bot.Router()
+    router.sleep_guard.start = AsyncMock()
+    router.sleep_guard.refresh = AsyncMock()
+    router.sleep_guard.stop = AsyncMock()
+
+    await router.refresh_sleep_guard()
+
+    router.sleep_guard.start.assert_awaited_once()
+    router.sleep_guard.refresh.assert_not_awaited()
+    router.sleep_guard.stop.assert_not_awaited()
+
+
+async def test_refresh_sleep_guard_active_sessions_uses_session_count(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    monkeypatch.setattr(bot, "SLEEP_GUARD_MODE", "active_sessions")
+    router = bot.Router()
+    router.sleep_guard.start = AsyncMock()
+    router.sleep_guard.refresh = AsyncMock()
+
+    await router.refresh_sleep_guard()
+
+    router.sleep_guard.refresh.assert_awaited_once_with(0)
+    router.sleep_guard.start.assert_not_awaited()
+
+
+async def test_refresh_sleep_guard_off_stops_guard(tmp_sqlite_path, monkeypatch):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    monkeypatch.setattr(bot, "SLEEP_GUARD_MODE", "off")
+    router = bot.Router()
+    router.sleep_guard.stop = AsyncMock()
+
+    await router.refresh_sleep_guard()
+
+    router.sleep_guard.stop.assert_awaited_once()
+
+
 # ── WireSession.send_to_surface ordering (wire.jsonl bug regression) ─────
 
 def _make_wire_session_with_mock_relay(tail_started: bool = False):
