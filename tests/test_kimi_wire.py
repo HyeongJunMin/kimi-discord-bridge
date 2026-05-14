@@ -2,11 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-import pytest
-
 from router.kimi_wire import KimiWireSession, _split_message
-
-pytestmark = pytest.mark.anyio
 
 
 class FakeWireClient:

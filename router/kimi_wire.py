@@ -90,6 +90,11 @@ class KimiWireSession:
     client: "KimiWireClient"
     active_turn: bool = False
 
+    @property
+    def session_uuid(self) -> str:
+        """Compatibility alias for the existing cmux-backed session object."""
+        return self.session_id
+
     async def prompt(self, content: str, thread: Any) -> None:
         self.active_turn = True
         buffer: list[str] = []

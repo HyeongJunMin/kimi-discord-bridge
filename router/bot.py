@@ -28,6 +28,7 @@ from .discord_relay import (
     ThreadRelay, SESSION_RE, DIRECTORY_RE, wait_for_wire_jsonl,
     find_live_kimi_surface_ids,
 )
+from .kimi_wire import KimiWireClient, KimiWireSession as SDKWireSession
 from .sleep_guard import SleepGuard
 
 log = logging.getLogger("router.bot")
@@ -146,6 +147,8 @@ class Router:
     def __init__(self):
         self.registry = Registry(REGISTRY_PATH)
         self.sessions: dict[int, WireSession] = {}   # thread_id → WireSession
+        self.wire_sessions: dict[int, SDKWireSession] = {}
+        self.wire_client = KimiWireClient()
         self.sleep_guard_mode = SLEEP_GUARD_MODE
         self.sleep_guard = SleepGuard(enabled=self.sleep_guard_mode != "off")
         self._delivery_task: asyncio.Task | None = None
@@ -156,7 +159,7 @@ class Router:
         if self.sleep_guard_mode == "always":
             await self.sleep_guard.start()
         elif self.sleep_guard_mode == "active_sessions":
-            await self.sleep_guard.refresh(len(self.sessions))
+            await self.sleep_guard.refresh(len(self.sessions) + len(self.wire_sessions))
         else:
             await self.sleep_guard.stop()
 
@@ -226,8 +229,34 @@ class Router:
                     self.registry.mark_message_failed(
                         item.id, "invalid thread id", terminal=True)
                     continue
+                if row.backend in {"wire", "restoring"}:
+                    try:
+                        thread = await self._fetch_thread(client, thread_id)
+                        wire_sess = await self._ensure_wire_session(
+                            row, reason=f"backend={row.backend}")
+                        await wire_sess.prompt(item.content, thread)
+                        self.registry.mark_message_delivered(item.id)
+                        self.registry.touch(item.thread_id)
+                        delivered += 1
+                    except Exception as e:
+                        log.warning("wire delivery failed for id=%s: %s",
+                                    item.id, e)
+                        self.registry.mark_message_failed(item.id, str(e))
+                    continue
                 sess = self.sessions.get(thread_id)
                 if not sess:
+                    if row.acp_session_id:
+                        try:
+                            thread = await self._fetch_thread(client, thread_id)
+                            wire_sess = await self._ensure_wire_session(
+                                row, reason="cmux session not loaded in memory")
+                            await wire_sess.prompt(item.content, thread)
+                            self.registry.mark_message_delivered(item.id)
+                            self.registry.touch(item.thread_id)
+                            delivered += 1
+                        except Exception as e:
+                            self.registry.mark_message_failed(item.id, str(e))
+                        continue
                     self.registry.mark_message_failed(
                         item.id, "session is active but not loaded in memory")
                     continue
@@ -239,10 +268,64 @@ class Router:
                     self.registry.touch(item.thread_id)
                     delivered += 1
                 except Exception as e:
-                    log.warning("queued delivery failed for id=%s: %s",
+                    log.warning("cmux delivery failed for id=%s: %s",
                                 item.id, e)
+                    if row.acp_session_id:
+                        try:
+                            thread = await self._fetch_thread(client, thread_id)
+                            wire_sess = await self._ensure_wire_session(
+                                row, reason=str(e))
+                            await wire_sess.prompt(item.content, thread)
+                            self.registry.mark_message_delivered(item.id)
+                            self.registry.touch(item.thread_id)
+                            delivered += 1
+                            continue
+                        except Exception as fallback_error:
+                            log.warning("wire fallback failed for id=%s: %s",
+                                        item.id, fallback_error)
+                            self.registry.mark_message_failed(
+                                item.id, str(fallback_error))
+                            continue
                     self.registry.mark_message_failed(item.id, str(e))
         return delivered
+
+    async def _fetch_thread(self, client: discord.Client,
+                            thread_id: int) -> discord.Thread:
+        thread = client.get_channel(thread_id)
+        if thread is None and hasattr(client, "fetch_channel"):
+            thread = await client.fetch_channel(thread_id)
+        if not isinstance(thread, discord.Thread) and not hasattr(thread, "send"):
+            raise RuntimeError(f"Discord thread not found: {thread_id}")
+        return thread
+
+    async def _ensure_wire_session(self, row: SessionRow, *,
+                                   reason: str) -> SDKWireSession:
+        thread_id = int(row.thread_id)
+        existing = self.wire_sessions.get(thread_id)
+        if existing:
+            return existing
+
+        old_cmux = self.sessions.pop(thread_id, None)
+        if old_cmux and old_cmux.relay:
+            await old_cmux.relay.stop()
+
+        wire_sess = await self.wire_client.create_session(
+            name=f"thread-{row.thread_id}",
+            work_dir=row.cwd,
+            session_id=row.acp_session_id,
+        )
+        self.wire_sessions[thread_id] = wire_sess
+        if wire_sess.session_id != row.acp_session_id:
+            self.registry.set_acp_session(row.thread_id, wire_sess.session_id)
+        self.registry.set_backend(
+            row.thread_id,
+            "wire",
+            surface_id=None,
+            abandoned_surface_id=row.monitor_surface_id or row.abandoned_surface_id,
+            last_error=reason,
+        )
+        await self.refresh_sleep_guard()
+        return wire_sess
 
     def _is_stale_message(self, item, now: int) -> bool:
         if QUEUE_MAX_MESSAGE_AGE_SEC <= 0:
@@ -270,7 +353,7 @@ class Router:
 
     async def create_session(self, *, thread: discord.Thread, owner_id: int,
                              workspace_id: str, workspace_name: str | None,
-                             cwd: str) -> tuple[WireSession, dict | None]:
+                             cwd: str) -> tuple[WireSession | SDKWireSession, dict | None]:
         # Create a terminal surface in the chosen workspace
         surface_info: dict | None = None
         try:
@@ -280,7 +363,12 @@ class Router:
 
         surf_id = (surface_info or {}).get("surface_id") or (surface_info or {}).get("id")
         if not surf_id:
-            raise RuntimeError("Failed to create cmux surface")
+            return await self._create_wire_session_from_new(
+                thread=thread, owner_id=owner_id, workspace_id=workspace_id,
+                workspace_name=workspace_name, cwd=cwd,
+                abandoned_surface_id=None,
+                reason="Failed to create cmux surface",
+            ), surface_info
 
         # Tag the cmux tab with the Discord thread name so the user can
         # eyeball which surface belongs to which thread (cmux defaults to a
@@ -294,13 +382,21 @@ class Router:
         # KIMI_CLI_NO_AUTO_UPDATE=1 suppresses the interactive upgrade gate
         # that blocks the welcome banner (and thus session UUID extraction)
         # when a new kimi-cli release exists. See kimi_cli/ui/shell/update.py.
-        await surface_send_text(surf_id, "KIMI_CLI_NO_AUTO_UPDATE=1 kimi\n")
+        try:
+            await surface_send_text(surf_id, "KIMI_CLI_NO_AUTO_UPDATE=1 kimi\n")
 
-        # Wait for banner and extract session UUID
-        session_uuid = await self._wait_for_session_uuid(surf_id)
-        if not session_uuid:
-            await close_surface(surf_id)
-            raise RuntimeError("Failed to extract session UUID from banner")
+            # Wait for banner and extract session UUID
+            session_uuid = await self._wait_for_session_uuid(surf_id)
+            if not session_uuid:
+                raise RuntimeError("Failed to extract session UUID from banner")
+        except Exception as e:
+            log.warning("cmux session start failed; using wire fallback: %s", e)
+            return await self._create_wire_session_from_new(
+                thread=thread, owner_id=owner_id, workspace_id=workspace_id,
+                workspace_name=workspace_name, cwd=cwd,
+                abandoned_surface_id=surf_id,
+                reason=str(e),
+            ), surface_info
 
         sess = WireSession(
             thread_id=thread.id,
@@ -328,6 +424,37 @@ class Router:
         ))
         await self.refresh_sleep_guard()
         return sess, surface_info
+
+    async def _create_wire_session_from_new(
+        self, *, thread: discord.Thread, owner_id: int,
+        workspace_id: str, workspace_name: str | None, cwd: str,
+        abandoned_surface_id: str | None, reason: str,
+    ) -> SDKWireSession:
+        wire_sess = await self.wire_client.create_session(
+            name=f"thread-{thread.id}",
+            work_dir=cwd,
+        )
+        self.wire_sessions[thread.id] = wire_sess
+        now = int(time.time())
+        self.registry.insert(SessionRow(
+            thread_id=str(thread.id),
+            guild_id=str(thread.guild.id) if thread.guild else None,
+            channel_id=str(thread.parent_id),
+            owner_user_id=str(owner_id),
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            cwd=cwd,
+            monitor_surface_id=None,
+            acp_session_id=wire_sess.session_id,
+            status="active",
+            created_at=now,
+            last_active_at=now,
+            backend="wire",
+            abandoned_surface_id=abandoned_surface_id,
+            last_backend_error=reason,
+        ))
+        await self.refresh_sleep_guard()
+        return wire_sess
 
     async def _wait_for_session_uuid(self, surface_id: str, timeout: float = 25.0) -> str | None:
         deadline = time.time() + timeout
@@ -364,6 +491,12 @@ class Router:
         sess = self.sessions.pop(thread_id, None)
         if sess:
             await sess.stop()
+        wire_sess = self.wire_sessions.pop(thread_id, None)
+        if wire_sess:
+            try:
+                await wire_sess.close()
+            except Exception as e:
+                log.warning("wire session close failed: %s", e)
         self.registry.fail_pending_for_thread(str(thread_id), "session ended")
         self.registry.update_status(str(thread_id), "dead")
         # Clean up any per-thread image uploads. macOS would clean /tmp

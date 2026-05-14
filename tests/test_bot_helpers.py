@@ -269,8 +269,8 @@ async def test_send_to_surface_strips_embedded_paste_escape_smuggling():
     assert sent.endswith("after\x1b[201~\r")
 
 
-def _session_row_for_queue(thread_id: str = "123") -> bot.SessionRow:
-    return bot.SessionRow(
+def _session_row_for_queue(thread_id: str = "123", **overrides) -> bot.SessionRow:
+    data = dict(
         thread_id=thread_id,
         guild_id="g",
         channel_id="c",
@@ -284,6 +284,8 @@ def _session_row_for_queue(thread_id: str = "123") -> bot.SessionRow:
         created_at=0,
         last_active_at=0,
     )
+    data.update(overrides)
+    return bot.SessionRow(**data)
 
 
 async def test_relay_user_message_queues_then_delivers_when_worker_stopped(
@@ -315,10 +317,10 @@ async def test_relay_user_message_queues_then_delivers_when_worker_stopped(
 async def test_relay_user_message_keeps_pending_on_cmux_failure(
     tmp_sqlite_path, monkeypatch
 ):
-    """cmux failure leaves the message in SQLite for a later retry."""
+    """cmux failure without a session id leaves the message pending."""
     monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
     router = bot.Router()
-    router.registry.insert(_session_row_for_queue("123"))
+    router.registry.insert(_session_row_for_queue("123", acp_session_id=None))
     sess = bot.WireSession(
         thread_id=123, surface_id="surf-1", session_uuid="sess-1",
         cwd="/tmp", owner_id=7)
@@ -335,6 +337,51 @@ async def test_relay_user_message_keeps_pending_on_cmux_failure(
 
     assert router.registry.count_pending_messages("123") == 1
     assert router.registry.last_delivery_error("123") == "timeout"
+
+
+async def test_relay_user_message_falls_back_to_wire_on_cmux_failure(
+    tmp_sqlite_path, monkeypatch
+):
+    """An existing cmux session with a stored session id can degrade to wire."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123"))
+    sess = bot.WireSession(
+        thread_id=123, surface_id="surf-1", session_uuid="sess-1",
+        cwd="/tmp", owner_id=7)
+    relay = MagicMock()
+    relay._tail_started = True
+    relay.stop = AsyncMock()
+    sess.relay = relay
+    router.sessions[123] = sess
+
+    thread = MagicMock()
+    thread.send = AsyncMock()
+    client = MagicMock()
+    client.get_channel.return_value = thread
+
+    wire_sess = MagicMock()
+    wire_sess.session_id = "sess-1"
+    wire_sess.prompt = AsyncMock()
+    with patch.object(
+        bot, "surface_send_text", new=AsyncMock(side_effect=CmuxError("timeout"))
+    ), patch.object(
+        router.wire_client,
+        "create_session",
+        new=AsyncMock(return_value=wire_sess),
+    ) as create_wire:
+        await router.relay_user_message(
+            123, "fallback me", client, author_user_id=7)
+
+    assert router.registry.count_pending_messages("123") == 0
+    row = router.registry.get_by_thread("123")
+    assert row.backend == "wire"
+    assert row.monitor_surface_id is None
+    assert row.abandoned_surface_id == "surf-1"
+    create_wire.assert_awaited_once_with(
+        name="thread-123", work_dir="/tmp", session_id="sess-1")
+    wire_sess.prompt.assert_awaited_once_with("fallback me", thread)
+    relay.stop.assert_awaited_once()
 
 
 async def test_relay_user_message_skips_stale_messages(
