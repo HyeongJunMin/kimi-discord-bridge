@@ -1,5 +1,6 @@
 """Registry: sqlite-backed session table CRUD."""
 from __future__ import annotations
+import sqlite3
 import time
 
 import pytest
@@ -113,12 +114,15 @@ def test_enqueue_and_list_pending_messages(tmp_sqlite_path):
     reg = Registry(tmp_sqlite_path)
 
     msg_id = reg.enqueue_message(
-        thread_id="t1", author_user_id="u1", content="hello")
+        thread_id="t1", author_user_id="u1", content="hello",
+        source_created_at=123, discord_message_id="m1")
 
     pending = reg.list_pending_messages(limit=10)
     assert [m.id for m in pending] == [msg_id]
     assert pending[0].content == "hello"
     assert pending[0].status == "pending"
+    assert pending[0].source_created_at == 123
+    assert pending[0].discord_message_id == "m1"
 
 
 def test_mark_message_delivered_removes_from_pending(tmp_sqlite_path):
@@ -155,3 +159,45 @@ def test_fail_pending_for_thread_terminally_fails_messages(tmp_sqlite_path):
     assert reg.count_pending_messages("t1") == 0
     assert reg.count_pending_messages("t2") == 1
     assert reg.last_delivery_error("t1") == "session ended"
+
+
+def test_mark_message_skipped_stale_removes_from_pending(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="old")
+
+    reg.mark_message_skipped_stale(msg_id, "too old")
+
+    assert reg.count_pending_messages("t1") == 0
+    assert reg.last_delivery_error("t1") == "too old"
+
+
+def test_registry_migrates_existing_inbound_message_table(tmp_sqlite_path):
+    conn = sqlite3.connect(tmp_sqlite_path)
+    conn.execute(
+        """CREATE TABLE inbound_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            author_user_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            next_attempt_at INTEGER NOT NULL,
+            delivered_at INTEGER
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO inbound_messages
+           (thread_id, author_user_id, content, created_at, next_attempt_at)
+           VALUES ('t1', 'u1', 'hello', 111, 111)"""
+    )
+    conn.commit()
+    conn.close()
+
+    reg = Registry(tmp_sqlite_path)
+
+    pending = reg.list_pending_messages(limit=10, now=111)
+    assert pending[0].source_created_at == 111
+    assert pending[0].discord_message_id is None

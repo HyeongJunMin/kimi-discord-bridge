@@ -4,6 +4,7 @@ Replaces ACP with cmux surface + wire.jsonl tail.
 """
 from __future__ import annotations
 import asyncio, logging, os, signal, sqlite3, time
+import inspect
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +59,25 @@ def _sleep_guard_mode_from_env(env: dict[str, str] = os.environ) -> str:
 
 
 SLEEP_GUARD_MODE = _sleep_guard_mode_from_env()
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("invalid %s=%r; falling back to %s", name, raw, default)
+        return default
+    if value < 0:
+        log.warning("invalid %s=%r; falling back to %s", name, raw, default)
+        return default
+    return value
+
+
+QUEUE_MAX_MESSAGE_AGE_SEC = _nonnegative_int_env(
+    "QUEUE_MAX_MESSAGE_AGE_SEC", 300)
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -184,7 +204,17 @@ class Router:
                                    limit: int = 20) -> int:
         delivered = 0
         async with self._delivery_lock:
+            now = int(time.time())
             for item in self.registry.list_pending_messages(limit=limit):
+                if self._is_stale_message(item, now):
+                    age = now - int(item.source_created_at or item.created_at)
+                    error = (
+                        f"message is stale ({age}s old; max "
+                        f"{QUEUE_MAX_MESSAGE_AGE_SEC}s)"
+                    )
+                    self.registry.mark_message_skipped_stale(item.id, error)
+                    await self._notify_stale_message(client, item.thread_id, age)
+                    continue
                 row = self.registry.get_by_thread(item.thread_id)
                 if not row or row.status != "active":
                     self.registry.mark_message_failed(
@@ -213,6 +243,30 @@ class Router:
                                 item.id, e)
                     self.registry.mark_message_failed(item.id, str(e))
         return delivered
+
+    def _is_stale_message(self, item, now: int) -> bool:
+        if QUEUE_MAX_MESSAGE_AGE_SEC <= 0:
+            return False
+        source_ts = item.source_created_at or item.created_at
+        return now - int(source_ts) > QUEUE_MAX_MESSAGE_AGE_SEC
+
+    async def _notify_stale_message(self, client: discord.Client,
+                                    thread_id: str, age: int) -> None:
+        try:
+            thread = client.get_channel(int(thread_id))
+        except Exception:
+            thread = None
+        if not thread or not hasattr(thread, "send"):
+            return
+        try:
+            result = thread.send(
+                "⚠️ 오래된 메시지라 kimi에 자동 전달하지 않았습니다. "
+                f"({age}s 지연) 필요하면 다시 보내주세요."
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            log.exception("stale message notice failed for thread %s", thread_id)
 
     async def create_session(self, *, thread: discord.Thread, owner_id: int,
                              workspace_id: str, workspace_name: str | None,
@@ -288,12 +342,16 @@ class Router:
 
     async def relay_user_message(self, thread_id: int, text: str,
                                  client: discord.Client,
-                                 *, author_user_id: int) -> int:
+                                 *, author_user_id: int,
+                                 source_created_at: int | None = None,
+                                 discord_message_id: str | None = None) -> int:
         log.info("Discord → Queue: thread=%s text=%r", thread_id, text)
         message_id = self.registry.enqueue_message(
             thread_id=str(thread_id),
             author_user_id=str(author_user_id),
             content=text,
+            source_created_at=source_created_at,
+            discord_message_id=discord_message_id,
         )
         self.registry.touch(str(thread_id))
         self.wake_delivery_worker()
@@ -1405,8 +1463,11 @@ async def on_message(msg: discord.Message):
             return
 
     payload = _compose_message_with_attachments(msg.content, saved_paths)
+    source_created_at = int(msg.created_at.timestamp()) if msg.created_at else None
     await router.relay_user_message(
-        msg.channel.id, payload, client, author_user_id=msg.author.id)
+        msg.channel.id, payload, client, author_user_id=msg.author.id,
+        source_created_at=source_created_at,
+        discord_message_id=str(msg.id))
 
 
 @client.event

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     retry_count     INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     created_at      INTEGER NOT NULL,
+    source_created_at INTEGER,
+    discord_message_id TEXT,
     next_attempt_at INTEGER NOT NULL,
     delivered_at    INTEGER
 );
@@ -67,6 +69,8 @@ class InboundMessageRow:
     retry_count: int
     last_error: str | None
     created_at: int
+    source_created_at: int | None
+    discord_message_id: str | None
     next_attempt_at: int
     delivered_at: int | None
 
@@ -77,7 +81,22 @@ class Registry:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate_inbound_messages()
         self.conn.commit()
+
+    def _migrate_inbound_messages(self) -> None:
+        cur = self.conn.execute("PRAGMA table_info(inbound_messages)")
+        columns = {r["name"] for r in cur.fetchall()}
+        if "source_created_at" not in columns:
+            self.conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN source_created_at INTEGER")
+            self.conn.execute(
+                """UPDATE inbound_messages
+                   SET source_created_at=created_at
+                   WHERE source_created_at IS NULL""")
+        if "discord_message_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE inbound_messages ADD COLUMN discord_message_id TEXT")
 
     def insert(self, row: SessionRow) -> None:
         # INSERT OR REPLACE so re-attaching to a thread whose row still
@@ -121,14 +140,18 @@ class Registry:
         self.conn.commit()
 
     def enqueue_message(self, *, thread_id: str, author_user_id: str,
-                        content: str) -> int:
+                        content: str, source_created_at: int | None = None,
+                        discord_message_id: str | None = None) -> int:
         now = int(time.time())
+        source_ts = now if source_created_at is None else int(source_created_at)
         cur = self.conn.execute(
             """INSERT INTO inbound_messages
                (thread_id, author_user_id, content, status, retry_count,
-                last_error, created_at, next_attempt_at, delivered_at)
-               VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, NULL)""",
-            (thread_id, author_user_id, content, now, now),
+                last_error, created_at, source_created_at, discord_message_id,
+                next_attempt_at, delivered_at)
+               VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, ?, ?, NULL)""",
+            (thread_id, author_user_id, content, now, source_ts,
+             discord_message_id, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -175,6 +198,16 @@ class Registry:
                     next_attempt_at=?
                 WHERE id=?""",
             (status, error[:1000], now + delay, message_id),
+        )
+        self.conn.commit()
+
+    def mark_message_skipped_stale(self, message_id: int, error: str) -> None:
+        now = int(time.time())
+        self.conn.execute(
+            """UPDATE inbound_messages
+               SET status='skipped_stale', last_error=?, next_attempt_at=?
+               WHERE id=?""",
+            (error[:1000], now, message_id),
         )
         self.conn.commit()
 

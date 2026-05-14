@@ -337,6 +337,36 @@ async def test_relay_user_message_keeps_pending_on_cmux_failure(
     assert router.registry.last_delivery_error("123") == "timeout"
 
 
+async def test_relay_user_message_skips_stale_messages(
+    tmp_sqlite_path, monkeypatch
+):
+    """Messages written long before wake-up must not execute later."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    monkeypatch.setattr(bot, "QUEUE_MAX_MESSAGE_AGE_SEC", 300)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123"))
+    sess = bot.WireSession(
+        thread_id=123, surface_id="surf-1", session_uuid="sess-1",
+        cwd="/tmp", owner_id=7)
+    router.sessions[123] = sess
+    client = MagicMock()
+    thread = MagicMock()
+    thread.send = AsyncMock()
+    client.get_channel.return_value = thread
+
+    send_mock = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=send_mock), \
+         patch.object(bot.time, "time", return_value=10_000):
+        await router.relay_user_message(
+            123, "old command", client, author_user_id=7,
+            source_created_at=9_000, discord_message_id="m-old")
+
+    send_mock.assert_not_awaited()
+    assert router.registry.count_pending_messages("123") == 0
+    assert "stale" in (router.registry.last_delivery_error("123") or "")
+    thread.send.assert_awaited_once()
+
+
 # ── create_session renames cmux tab to thread name ────────────────────────
 
 async def test_create_session_renames_cmux_tab_with_short_title(monkeypatch):
