@@ -13,6 +13,7 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 - 하나의 Discord 스레드 = 하나의 kimi-cli 세션
 - 스레드에 메시지를 보내면 로컬 kimi-cli로 전달되고, kimi의 응답이 스레드에 스트리밍됨
 - 같은 kimi 세션을 PC 앞 cmux 터미널과 Discord 양쪽에서 동시에 볼 수 있음
+- cmux가 잠금 상태에서 terminal surface를 못 만들거나 못 읽으면, 같은 Kimi session id로 `kimi --wire` fallback을 열어 Discord 대화를 계속 처리하고, cmux가 다시 준비되면 `kimi --session <session_id>`로 같은 세션을 surface에 복구
 
 > 이 봇을 왜 직접 만들었는지 (Claude Code Channels / kimi-cli 메신저 통합과의 비교, 운영상 발견한 한계) 는 [docs/WHY.md](docs/WHY.md) 참고.
 
@@ -39,6 +40,7 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 - **cmux 탭 이름 자동 설정** — `/new`, `/attach`, `/rebind` 시 cmux surface 탭이 `<workspace 앞 3글자>-<thread 끝 4자리>` 형식으로 자동 명명. 여러 세션이 떠있을 때 PC 화면에서 식별 용이.
 - **잠금 상태 유지 지원** — `SLEEP_GUARD_MODE=always` 또는 `active_sessions` 이면 브릿지가 `caffeinate -imsu` helper process를 실행해 idle/system sleep을 방지합니다. 디스플레이 sleep은 막지 않으므로 잠금 화면이나 화면 꺼짐 상태는 그대로 사용할 수 있습니다.
 - **메시지 유실 방지 queue** — Discord에서 받은 사용자 메시지는 먼저 로컬 SQLite 파일(`router.sqlite3`, `SESSION_DB_PATH`로 변경 가능)에 `pending` 상태로 저장한 뒤 cmux/kimi에 전달합니다. cmux RPC가 일시적으로 timeout 되면 메시지는 pending으로 남고 worker가 재시도합니다.
+- **cmux-first wire fallback** — 기본 경로는 계속 `Discord → bridge → cmux → kimi-cli` 입니다. cmux `send/read`가 실패하고 Kimi session id가 저장돼 있으면 bridge가 `kimi --wire` SDK 세션으로 전환해 같은 메시지를 처리합니다. 잠금해제 후 restore worker가 새 cmux surface를 만들고 `kimi --session <session_id>`를 실행해 cmux 경로로 되돌립니다.
 - **오래된 메시지 자동 실행 차단** — Mac이 실제 sleep에 들어갔다 깨어나면 Discord 이벤트가 뒤늦게 들어올 수 있습니다. `QUEUE_MAX_MESSAGE_AGE_SEC` 보다 오래된 메시지는 kimi에 전달하지 않고 `skipped_stale` 로 기록한 뒤 thread에 재전송 안내를 남깁니다.
 - **스레드 자동 보관 대응** — Discord가 스레드를 자동으로 archive하면 세션이 종료되고 cmux surface도 정리됨. 보관 해제 시 봇이 복구 방법(`/attach` 또는 `/new`)을 안내.
 - **봇 재시작 시 세션 보존** — 봇이 종료되어도 cmux surface는 살려둠. 재시작 후 동일 스레드에서 `/attach`로 재연결 가능.
@@ -63,6 +65,7 @@ Discord 채널/스레드를 통해 로컬 [kimi-cli](https://github.com/Moonshot
 
 - **macOS** (최근 버전, cmux가 Mac 전용 앱입니다)
 - **Python 3.10 이상**
+- **Node.js 20 이상** — Kimi Agent SDK wire fallback helper 실행용
 - **[cmux.app](https://cmux.io/)** — `/Applications/cmux.app`에 설치되어 있어야 함
 - **[kimi-cli](https://github.com/MoonshotAI/kimi-cli)** — `kimi` 명령이 PATH에 있어야 함
 - **Discord Developer 계정** — 봇 토큰 발급 가능

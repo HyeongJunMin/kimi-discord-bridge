@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -145,7 +146,7 @@ class KimiWireClient:
         if command is not None:
             self.command = command
         elif helper:
-            self.command = helper.split()
+            self.command = shlex.split(helper)
         else:
             self.command = ["node", str(DEFAULT_HELPER)]
         self.proc: asyncio.subprocess.Process | None = None
