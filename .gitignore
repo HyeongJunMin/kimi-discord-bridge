@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+node_modules/
 .DS_Store
 *.txt
 !requirements*.txt
