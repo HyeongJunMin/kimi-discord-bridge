@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import shlex
+import shutil
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,40 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HELPER = Path(__file__).with_name("kimi_wire_bridge.mjs")
 MAX_DISCORD_MESSAGE = 1900
+
+# Wire fallback exists to keep a Kimi session usable when cmux is unreachable
+# (e.g. screen locked during /new). By default we mirror the cmux relay's
+# user-facing output and hide internal noise: tool plumbing, raw thinking
+# blocks, and per-turn debug breadcrumbs. Opt-in flags re-enable them for
+# debugging.
+_SHOW_TOOLS = os.environ.get("KIMI_WIRE_SHOW_TOOLS", "").lower() in {"1", "true", "yes"}
+_SHOW_THINKING = os.environ.get("KIMI_WIRE_SHOW_THINKING", "").lower() in {"1", "true", "yes"}
+
+# Common absolute paths where `node` lives on macOS dev machines. Tried in
+# order when PATH does not contain node — happens whenever the bot is
+# launched from a stock-PATH shell (launchd, `nohup ./run-bot.sh`) that
+# never sourced ~/.zshrc.
+_NODE_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+)
+
+
+def _resolve_node_cmd() -> str:
+    """Locate the node binary. Honors KIMI_NODE_CMD, then PATH, then a
+    short list of well-known absolute paths. Returns the literal "node" as
+    a last resort so spawn raises a clear FileNotFoundError instead of
+    silently doing something else."""
+    explicit = os.environ.get("KIMI_NODE_CMD")
+    if explicit:
+        return explicit
+    found = shutil.which("node")
+    if found:
+        return found
+    for candidate in _NODE_FALLBACK_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "node"
 
 
 class KimiWireError(RuntimeError):
@@ -47,6 +83,8 @@ def _content_part_text(payload: dict[str, Any]) -> str:
     if part_type == "text":
         return str(payload.get("text") or "")
     if part_type == "think":
+        if not _SHOW_THINKING:
+            return ""
         text = str(payload.get("think") or "")
         if len(text) > 3500:
             text = text[:3500] + "..."
@@ -59,7 +97,7 @@ def _content_part_text(payload: dict[str, Any]) -> str:
         else:
             url = str(payload.get("url") or "")
         return f"[{part_type}] {url}\n"
-    return f"[unknown content: {part_type}]\n"
+    return ""
 
 
 def _tool_result_text(payload: dict[str, Any]) -> str:
@@ -74,6 +112,14 @@ def _tool_result_text(payload: dict[str, Any]) -> str:
     if len(text) > 1500:
         text = text[:1500] + "..."
     return f"\nTool result:\n```\n{text}\n```\n"
+
+
+def _is_ignorable_wire_error(event: dict[str, Any], payload: dict[str, Any]) -> bool:
+    message = str(event.get("message") or payload.get("message") or "")
+    return message in {
+        "Unknown event type: MCPLoadingBegin",
+        "Unknown event type: MCPLoadingEnd",
+    }
 
 
 async def _send_text(thread: Any, text: str) -> None:
@@ -104,15 +150,22 @@ class KimiWireSession:
                 event_type = event.get("type")
                 payload = event.get("payload") or {}
                 if event_type == "TurnBegin":
-                    await _send_text(thread, "wire fallback: turn started")
+                    # Internal turn boundary — no user-facing noise.
+                    log.debug("wire TurnBegin")
                 elif event_type == "ContentPart":
                     buffer.append(_content_part_text(payload))
                 elif event_type == "ToolCall":
-                    fn = ((payload.get("function") or {}).get("name")
-                          if isinstance(payload, dict) else None)
-                    await _send_text(thread, f"Tool: {fn or 'unknown'}")
+                    if _SHOW_TOOLS:
+                        fn = ((payload.get("function") or {}).get("name")
+                              if isinstance(payload, dict) else None)
+                        await _send_text(thread, f"🔧 `{fn or 'tool'}`")
+                    else:
+                        log.debug("hidden wire ToolCall: %s", payload)
                 elif event_type == "ToolResult":
-                    buffer.append(_tool_result_text(payload))
+                    if _SHOW_TOOLS:
+                        buffer.append(_tool_result_text(payload))
+                    else:
+                        log.debug("hidden wire ToolResult")
                 elif event_type == "ApprovalRequest":
                     await _send_text(
                         thread,
@@ -127,6 +180,9 @@ class KimiWireSession:
                         await _send_text(thread, "".join(buffer))
                         buffer.clear()
                 elif event_type in {"TurnError", "ParseError", "error"}:
+                    if _is_ignorable_wire_error(event, payload):
+                        log.debug("ignored Kimi wire status parse error: %s", event)
+                        continue
                     message = event.get("message") or payload.get("message") or event
                     await _send_text(thread, f"wire fallback error: {message}")
                 else:
@@ -148,7 +204,7 @@ class KimiWireClient:
         elif helper:
             self.command = shlex.split(helper)
         else:
-            self.command = ["node", str(DEFAULT_HELPER)]
+            self.command = [_resolve_node_cmd(), str(DEFAULT_HELPER)]
         self.proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._next_id = 1
@@ -157,11 +213,18 @@ class KimiWireClient:
     async def start(self) -> None:
         if self.proc and self.proc.returncode is None:
             return
+        # `os.setpgrp` puts the node helper in its own process group so that
+        # `stop()` can kill the helper *and* its kimi-cli grandchild as a
+        # unit. Without this, SIGKILLing the bot leaves the node helper and
+        # its spawned kimi-cli orphaned to launchd (PPID=1). Those orphans
+        # stay attached to the same Kimi session_id the cmux side later
+        # resumes, producing duplicate Discord responses.
         self.proc = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setpgrp,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         asyncio.create_task(self._read_stderr())
@@ -249,11 +312,27 @@ class KimiWireClient:
 
     async def stop(self) -> None:
         if self.proc and self.proc.returncode is None:
-            self.proc.terminate()
+            pid = self.proc.pid
+            # The helper was started with its own pgrp (see `start()`).
+            # Signal the entire group so the kimi-cli grandchild dies with
+            # the node helper — single `terminate()` would only hit node and
+            # leave kimi-cli orphaned.
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as e:
+                log.warning("killpg SIGTERM failed for helper pid=%s: %s", pid, e)
+                self.proc.terminate()
             try:
                 await asyncio.wait_for(self.proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self.proc.kill()
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    self.proc.kill()
                 await self.proc.wait()
         if self._reader_task:
             self._reader_task.cancel()

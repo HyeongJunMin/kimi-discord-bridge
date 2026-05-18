@@ -81,6 +81,10 @@ QUEUE_MAX_MESSAGE_AGE_SEC = _nonnegative_int_env(
     "QUEUE_MAX_MESSAGE_AGE_SEC", 300)
 RESTORE_WATCH_INTERVAL_SEC = _nonnegative_int_env(
     "RESTORE_WATCH_INTERVAL_SEC", 5)
+RESTORE_VERIFY_TIMEOUT_SEC = _nonnegative_int_env(
+    "RESTORE_VERIFY_TIMEOUT_SEC", 15)
+RESTORE_RETRY_BACKOFF_SEC = _nonnegative_int_env(
+    "RESTORE_RETRY_BACKOFF_SEC", 60)
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -137,6 +141,8 @@ class WireSession:
     async def stop(self):
         if self.relay:
             await self.relay.stop()
+        log.info("surface.close: reason=session_stop thread=%s surface=%s",
+                 self.thread_id, self.surface_id)
         try:
             await close_surface(self.surface_id)
         except CmuxError as e:
@@ -207,7 +213,10 @@ class Router:
     async def _restore_worker(self, client: discord.Client) -> None:
         while True:
             try:
-                await self.restore_wire_sessions_once(client)
+                restored = await self.restore_wire_sessions_once(client)
+                if restored:
+                    log.info("restore worker: restored %d session(s) this tick",
+                             restored)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -217,8 +226,16 @@ class Router:
     async def restore_wire_sessions_once(self, client: discord.Client) -> int:
         restored = 0
         async with self._restore_lock:
+            now = int(time.time())
             for row in self.registry.list_active():
                 if row.backend not in {"wire", "restoring"} or not row.acp_session_id:
+                    continue
+                # Backoff: don't hammer cmux when a prior attempt just
+                # failed. Without this, restore_worker would create a fresh
+                # surface every RESTORE_WATCH_INTERVAL_SEC ticks and leak
+                # them (cmux saw 2000+ ghost surfaces in one regression).
+                if (row.restore_attempt_at
+                        and now - row.restore_attempt_at < RESTORE_RETRY_BACKOFF_SEC):
                     continue
                 thread_id = int(row.thread_id)
                 wire_sess = self.wire_sessions.get(thread_id)
@@ -250,22 +267,57 @@ class Router:
             abandoned_surface_id=row.abandoned_surface_id,
             restore_attempt_at=int(time.time()),
         )
+
+        # Close the wire helper FIRST. If the SDK keeps the session attached
+        # while cmux tries to `kimi --session <uuid>`, both ends emit events
+        # for the same session_id and Discord sees duplicate responses.
+        # Releasing the SDK handle before the cmux resume avoids that race.
+        wire_sess = self.wire_sessions.pop(thread_id, None)
+        if wire_sess:
+            try:
+                await wire_sess.close()
+            except Exception as e:
+                log.warning("wire close before restore failed: %s", e)
+
         surface_info = await create_surface(row.workspace_id, focus=False)
         surf_id = ((surface_info or {}).get("surface_id")
                    or (surface_info or {}).get("id"))
+        log.info("surface.create: reason=restore thread=%s workspace=%s surface=%s",
+                 thread_id, row.workspace_id, surf_id)
         if not surf_id:
             raise RuntimeError("cmux restore created no surface id")
+        attached = False
         try:
-            await rename_tab(surf_id, _short_tab_title(row.workspace_name, thread.name))
-        except Exception as e:
-            log.warning("restore rename_tab failed: %s", e)
-        await self._wait_for_surface_ready(surf_id)
-        cmd = (
-            f"cd {shlex.quote(row.cwd)} && "
-            f"KIMI_CLI_NO_AUTO_UPDATE=1 kimi --session "
-            f"{shlex.quote(row.acp_session_id)}\n"
-        )
-        await surface_send_text(surf_id, cmd)
+            try:
+                await rename_tab(surf_id, _short_tab_title(row.workspace_name, thread.name))
+            except Exception as e:
+                log.warning("restore rename_tab failed: %s", e)
+            await self._wait_for_surface_ready(surf_id)
+            cmd = (
+                f"cd {shlex.quote(row.cwd)} && "
+                f"KIMI_CLI_NO_AUTO_UPDATE=1 kimi --session "
+                f"{shlex.quote(row.acp_session_id)}\n"
+            )
+            await surface_send_text(surf_id, cmd)
+            if not await self._verify_session_resumed(surf_id, row.acp_session_id):
+                raise RuntimeError(
+                    f"kimi --session {row.acp_session_id} did not attach to "
+                    f"cmux surface {surf_id} within timeout"
+                )
+            attached = True
+        finally:
+            # If we bail after create_surface, close the surface we just
+            # made. Without this the restore_worker leaked one new surface
+            # per failed attempt (cmux ended up with thousands of ghost
+            # tabs after a stuck restore loop).
+            if not attached:
+                log.info("surface.close: reason=restore_verify_failed "
+                         "thread=%s surface=%s acp_session=%s",
+                         thread_id, surf_id, row.acp_session_id)
+                try:
+                    await close_surface(surf_id)
+                except Exception as e:
+                    log.warning("close_surface after failed restore: %s", e)
         cmux_sess = WireSession(
             thread_id=thread_id,
             surface_id=surf_id,
@@ -281,12 +333,6 @@ class Router:
             surface_id=surf_id,
             abandoned_surface_id=row.abandoned_surface_id,
         )
-        wire_sess = self.wire_sessions.pop(thread_id, None)
-        if wire_sess:
-            try:
-                await wire_sess.close()
-            except Exception as e:
-                log.warning("wire close after restore failed: %s", e)
         await self.refresh_sleep_guard()
         try:
             await thread.send(
@@ -335,7 +381,7 @@ class Router:
         delivered = 0
         async with self._delivery_lock:
             now = int(time.time())
-            for item in self.registry.list_pending_messages(limit=limit):
+            for item in self.registry.claim_pending_messages(limit=limit):
                 if self._is_stale_message(item, now):
                     age = now - int(item.source_created_at or item.created_at)
                     error = (
@@ -356,7 +402,17 @@ class Router:
                     self.registry.mark_message_failed(
                         item.id, "invalid thread id", terminal=True)
                     continue
-                if row.backend in {"wire", "restoring"}:
+                if row.backend == "restoring":
+                    # cmux resume is in flight; sending to wire now would
+                    # race the freshly-resumed kimi-cli on the same session
+                    # and emit duplicate responses. Leave the message
+                    # pending; the next delivery tick (after restore
+                    # completes) will route it through cmux.
+                    log.debug("delivery held while backend=restoring id=%s",
+                              item.id)
+                    self.registry.release_message(item.id)
+                    continue
+                if row.backend == "wire":
                     try:
                         thread = await self._fetch_thread(client, thread_id)
                         wire_sess = await self._ensure_wire_session(
@@ -593,6 +649,25 @@ class Router:
                     return m.group(1)
             await asyncio.sleep(0.5)
         return None
+
+    async def _verify_session_resumed(self, surface_id: str,
+                                      expected_uuid: str,
+                                      timeout: float | None = None) -> bool:
+        """Confirm kimi-cli inside the cmux surface actually attached to the
+        expected acp_session_id. Without this check, a failed `kimi --session`
+        leaves a dead surface and the bot wrongly claims restore success."""
+        if timeout is None:
+            timeout = float(RESTORE_VERIFY_TIMEOUT_SEC)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                text = await surface_read_text(surface_id)
+            except CmuxError:
+                text = None
+            if text and expected_uuid in text:
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def relay_user_message(self, thread_id: int, text: str,
                                  client: discord.Client,
@@ -1816,6 +1891,116 @@ async def _shutdown() -> None:
         log.exception("client close failed")
 
 
+BOT_PID_FILE = os.environ.get("BOT_PID_FILE", "router.bot.pid")
+
+
+def _acquire_singleton_lock(path: str = BOT_PID_FILE):
+    """Take an exclusive non-blocking flock on a pid file. Returns the open
+    file handle on success — keep a reference; closing the fd releases the
+    lock. Raises SystemExit if another bot already holds it.
+
+    Two bots polling the same sqlite at once doubles restore_worker traffic
+    and (in the prod incident) created 60+ ghost cmux surfaces. The shell
+    `pgrep` guard in run-bot.sh catches the common case; this fcntl lock
+    also blocks anyone bypassing run-bot.sh (e.g. `python -m router.bot`
+    directly) from spawning a duplicate.
+    """
+    import fcntl
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise SystemExit(
+            f"another router.bot already holds {path}; refusing to start a "
+            f"second instance. kill the existing one first."
+        )
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _find_orphan_wire_pids(ps_output: str) -> list[int]:
+    """Parse `ps -axo pid,ppid,tty,command` output and return PIDs that are
+    leftovers from a prior crashed bot:
+
+      - PPID == 1 (orphan, adopted by launchd)
+      - command is either the node wire helper (`kimi_wire_bridge.mjs`) or
+        a kimi-cli (`Kimi Code`) without a controlling TTY (`?? `)
+
+    cmux's *live* kimi-cli always has a real tty (e.g. `ttys011`) and is
+    parented to the cmux daemon — neither orphan criterion is met, so it is
+    never reaped. Pure parser; the side-effecting reaper calls this.
+    """
+    orphans: list[int] = []
+    for line in ps_output.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        tty = parts[2]
+        command = parts[3]
+        if ppid != 1:
+            continue
+        if "kimi_wire_bridge" in command:
+            orphans.append(pid)
+            continue
+        if command.lstrip().startswith("Kimi Code") and tty in {"?", "??"}:
+            orphans.append(pid)
+    return orphans
+
+
+async def _reap_orphan_wire_processes() -> int:
+    """Find and kill wire-fallback processes left over from a previous bot
+    instance. Runs once at startup so a crashed-bot scenario can't leak
+    duplicate clients onto the same Kimi session_id.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ps", "-axo", "pid,ppid,tty,command",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    ps_text = out.decode()
+    pids = _find_orphan_wire_pids(ps_text)
+    if pids:
+        # Log the exact ps lines we matched so we can audit whether the
+        # filter is grabbing unrelated `Kimi Code` / `kimi_wire_bridge`
+        # processes (e.g. cmux-spawned kimi-cli that briefly lost its tty
+        # on screen-lock). Without this we can't tell after the fact why a
+        # surface vanished at bot restart.
+        for line in ps_text.splitlines():
+            parts = line.split(None, 1)
+            if parts and parts[0].isdigit() and int(parts[0]) in pids:
+                log.info("reaper: matched orphan candidate: %s", line.rstrip())
+    reaped = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            reaped += 1
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            log.warning("SIGTERM orphan pid=%s failed: %s", pid, e)
+    if pids:
+        await asyncio.sleep(1.0)
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        log.info("startup: reaped %d orphan wire process(es): %s",
+                 reaped, pids)
+    return reaped
+
+
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
     def _handler():
         log.info("signal received, beginning shutdown")
@@ -1832,10 +2017,14 @@ def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN is not set (check .env)")
+    _lock_fh = _acquire_singleton_lock()  # noqa: F841 — keep alive for process lifetime
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _install_signal_handlers(loop)
     try:
+        # Sweep any wire-fallback orphans from a previous crashed bot
+        # before letting the new instance attach to the same Kimi sessions.
+        loop.run_until_complete(_reap_orphan_wire_processes())
         loop.run_until_complete(client.start(token))
     except KeyboardInterrupt:
         loop.run_until_complete(_shutdown())

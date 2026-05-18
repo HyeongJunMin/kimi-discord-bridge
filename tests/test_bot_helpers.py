@@ -412,7 +412,8 @@ async def test_restore_wire_session_creates_cmux_surface_and_resumes_session(
     with patch.object(
         bot, "create_surface", new=AsyncMock(return_value={"surface_id": "surf-new"})
     ), patch.object(
-        bot, "surface_read_text", new=AsyncMock(return_value="$")
+        bot, "surface_read_text",
+        new=AsyncMock(return_value="$ Session: sess-1"),
     ), patch.object(
         bot, "surface_send_text", new=send_mock
     ), patch.object(
