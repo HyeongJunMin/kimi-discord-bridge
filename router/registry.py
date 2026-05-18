@@ -44,6 +44,14 @@ CREATE INDEX IF NOT EXISTS idx_inbound_pending
     ON inbound_messages(status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbound_thread_status
     ON inbound_messages(thread_id, status);
+
+CREATE TABLE IF NOT EXISTS inbound_message_dedup (
+    thread_id          TEXT NOT NULL,
+    discord_message_id TEXT NOT NULL,
+    message_row_id     INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    PRIMARY KEY (thread_id, discord_message_id)
+);
 """
 
 
@@ -125,6 +133,15 @@ class Registry:
         if "discord_message_id" not in columns:
             self.conn.execute(
                 "ALTER TABLE inbound_messages ADD COLUMN discord_message_id TEXT")
+        self.conn.execute(
+            """INSERT OR IGNORE INTO inbound_message_dedup (
+                   thread_id, discord_message_id, message_row_id, created_at
+               )
+               SELECT thread_id, discord_message_id, MIN(id), MIN(created_at)
+               FROM inbound_messages
+               WHERE discord_message_id IS NOT NULL
+               GROUP BY thread_id, discord_message_id"""
+        )
 
     def insert(self, row: SessionRow) -> None:
         # INSERT OR REPLACE so re-attaching to a thread whose row still
@@ -223,17 +240,48 @@ class Registry:
                         discord_message_id: str | None = None) -> int:
         now = int(time.time())
         source_ts = now if source_created_at is None else int(source_created_at)
-        cur = self.conn.execute(
-            """INSERT INTO inbound_messages
-               (thread_id, author_user_id, content, status, retry_count,
-                last_error, created_at, source_created_at, discord_message_id,
-                next_attempt_at, delivered_at)
-               VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, ?, ?, NULL)""",
-            (thread_id, author_user_id, content, now, source_ts,
-             discord_message_id, now),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if discord_message_id:
+                dedup = self.conn.execute(
+                    """INSERT OR IGNORE INTO inbound_message_dedup (
+                           thread_id, discord_message_id, message_row_id,
+                           created_at
+                       )
+                       VALUES (?, ?, 0, ?)""",
+                    (thread_id, discord_message_id, now),
+                )
+                if dedup.rowcount == 0:
+                    row = self.conn.execute(
+                        """SELECT message_row_id FROM inbound_message_dedup
+                           WHERE thread_id=? AND discord_message_id=?""",
+                        (thread_id, discord_message_id),
+                    ).fetchone()
+                    self.conn.commit()
+                    return int(row["message_row_id"])
+
+            cur = self.conn.execute(
+                """INSERT INTO inbound_messages
+                   (thread_id, author_user_id, content, status, retry_count,
+                    last_error, created_at, source_created_at,
+                    discord_message_id, next_attempt_at, delivered_at)
+                   VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, ?, ?, NULL)""",
+                (thread_id, author_user_id, content, now, source_ts,
+                 discord_message_id, now),
+            )
+            message_id = int(cur.lastrowid)
+            if discord_message_id:
+                self.conn.execute(
+                    """UPDATE inbound_message_dedup
+                       SET message_row_id=?
+                       WHERE thread_id=? AND discord_message_id=?""",
+                    (message_id, thread_id, discord_message_id),
+                )
+            self.conn.commit()
+            return message_id
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def list_pending_messages(self, *, limit: int = 20,
                               now: int | None = None) -> list[InboundMessageRow]:
@@ -246,6 +294,51 @@ class Registry:
             (ts, limit),
         )
         return [InboundMessageRow(**dict(r)) for r in cur.fetchall()]
+
+    def claim_pending_messages(self, *, limit: int = 20,
+                               now: int | None = None,
+                               lease_seconds: int = 120) -> list[InboundMessageRow]:
+        ts = int(time.time()) if now is None else now
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                """UPDATE inbound_messages
+                   SET status='pending'
+                   WHERE status='inflight' AND next_attempt_at<=?""",
+                (ts,),
+            )
+            cur = self.conn.execute(
+                """SELECT * FROM inbound_messages
+                   WHERE status='pending' AND next_attempt_at<=?
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT ?""",
+                (ts, limit),
+            )
+            rows = cur.fetchall()
+            ids = [int(r["id"]) for r in rows]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                self.conn.execute(
+                    f"""UPDATE inbound_messages
+                        SET status='inflight', next_attempt_at=?
+                        WHERE id IN ({placeholders}) AND status='pending'""",
+                    (ts + lease_seconds, *ids),
+                )
+            self.conn.commit()
+            return [InboundMessageRow(**dict(r)) for r in rows]
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def release_message(self, message_id: int, *, delay: int = 1) -> None:
+        now = int(time.time())
+        self.conn.execute(
+            """UPDATE inbound_messages
+               SET status='pending', next_attempt_at=?
+               WHERE id=? AND status='inflight'""",
+            (now + max(0, delay), message_id),
+        )
+        self.conn.commit()
 
     def mark_message_delivered(self, message_id: int) -> None:
         now = int(time.time())
@@ -295,7 +388,7 @@ class Registry:
         self.conn.execute(
             """UPDATE inbound_messages
                SET status='failed', last_error=?, next_attempt_at=?
-               WHERE thread_id=? AND status='pending'""",
+               WHERE thread_id=? AND status IN ('pending', 'inflight')""",
             (reason[:1000], now, thread_id),
         )
         self.conn.commit()

@@ -91,6 +91,26 @@ async def test_wire_session_prompt_hides_thinking_by_default():
     assert sent == ["hi"]
 
 
+async def test_wire_session_prompt_ignores_mcp_loading_parse_errors():
+    thread = FakeThread()
+    sess = KimiWireSession(
+        name="s",
+        session_id="sid",
+        work_dir="/tmp",
+        client=FakeWireClient([
+            {"type": "error", "code": "UNKNOWN_EVENT_TYPE", "message": "Unknown event type: MCPLoadingBegin"},
+            {"type": "ContentPart", "payload": {"type": "text", "text": "done"}},
+            {"type": "error", "code": "UNKNOWN_EVENT_TYPE", "message": "Unknown event type: MCPLoadingEnd"},
+            {"type": "TurnEnd", "payload": {}},
+        ]),
+    )
+
+    await sess.prompt("hi", thread)
+
+    sent = [call.args[0] for call in thread.send.await_args_list]
+    assert sent == ["done"]
+
+
 async def test_wire_session_prompt_reports_questions():
     thread = FakeThread()
     sess = KimiWireSession(

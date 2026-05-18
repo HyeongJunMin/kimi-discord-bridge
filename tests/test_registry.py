@@ -165,6 +165,49 @@ def test_enqueue_and_list_pending_messages(tmp_sqlite_path):
     assert pending[0].discord_message_id == "m1"
 
 
+def test_enqueue_message_dedupes_discord_message_id(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+
+    first = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello",
+        discord_message_id="m1")
+    second = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello again",
+        discord_message_id="m1")
+
+    pending = reg.list_pending_messages(limit=10)
+    assert second == first
+    assert [m.id for m in pending] == [first]
+    assert pending[0].content == "hello"
+
+
+def test_claim_pending_messages_prevents_double_claim(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello",
+        discord_message_id="m1")
+    now = int(time.time())
+
+    claimed = reg.claim_pending_messages(limit=10, now=now)
+    claimed_again = reg.claim_pending_messages(limit=10, now=now)
+
+    assert [m.id for m in claimed] == [msg_id]
+    assert claimed_again == []
+    assert reg.list_pending_messages(limit=10, now=now) == []
+
+
+def test_claim_pending_messages_recovers_expired_inflight(tmp_sqlite_path):
+    reg = Registry(tmp_sqlite_path)
+    msg_id = reg.enqueue_message(
+        thread_id="t1", author_user_id="u1", content="hello")
+    now = int(time.time())
+
+    reg.claim_pending_messages(limit=10, now=now, lease_seconds=5)
+    claimed = reg.claim_pending_messages(limit=10, now=now + 5)
+
+    assert [m.id for m in claimed] == [msg_id]
+
+
 def test_mark_message_delivered_removes_from_pending(tmp_sqlite_path):
     reg = Registry(tmp_sqlite_path)
     msg_id = reg.enqueue_message(

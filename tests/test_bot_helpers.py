@@ -314,6 +314,35 @@ async def test_relay_user_message_queues_then_delivers_when_worker_stopped(
     send_mock.assert_awaited_once()
 
 
+async def test_relay_user_message_ignores_duplicate_discord_message_id(
+    tmp_sqlite_path, monkeypatch
+):
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_session_row_for_queue("123"))
+    sess = bot.WireSession(
+        thread_id=123, surface_id="surf-1", session_uuid="sess-1",
+        cwd="/tmp", owner_id=7)
+    relay = MagicMock()
+    relay._tail_started = True
+    relay.reset_message_anchor = MagicMock()
+    sess.relay = relay
+    router.sessions[123] = sess
+
+    send_mock = AsyncMock()
+    with patch.object(bot, "surface_send_text", new=send_mock):
+        first = await router.relay_user_message(
+            123, "queued hello", MagicMock(), author_user_id=7,
+            discord_message_id="m-1")
+        second = await router.relay_user_message(
+            123, "queued hello", MagicMock(), author_user_id=7,
+            discord_message_id="m-1")
+
+    assert second == first
+    assert router.registry.count_pending_messages("123") == 0
+    send_mock.assert_awaited_once()
+
+
 async def test_relay_user_message_keeps_pending_on_cmux_failure(
     tmp_sqlite_path, monkeypatch
 ):
