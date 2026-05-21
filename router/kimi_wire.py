@@ -209,6 +209,7 @@ class KimiWireClient:
         else:
             self.command = [_resolve_node_cmd(), str(DEFAULT_HELPER)]
         self.proc: asyncio.subprocess.Process | None = None
+        self._process_group_id: int | None = None
         self._reader_task: asyncio.Task | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Queue[dict[str, Any]]] = {}
@@ -216,7 +217,8 @@ class KimiWireClient:
     async def start(self) -> None:
         if self.proc and self.proc.returncode is None:
             return
-        # `os.setpgrp` puts the node helper in its own process group so that
+        # `start_new_session=True` puts the node helper in its own session and
+        # process group so that
         # `stop()` can kill the helper *and* its kimi-cli grandchild as a
         # unit. Without this, SIGKILLing the bot leaves the node helper and
         # its spawned kimi-cli orphaned to launchd (PPID=1). Those orphans
@@ -227,8 +229,14 @@ class KimiWireClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setpgrp,
+            start_new_session=True,
         )
+        try:
+            self._process_group_id = os.getpgid(self.proc.pid)
+        except OSError as e:
+            self._process_group_id = None
+            log.warning("could not resolve helper process group pid=%s: %s",
+                        self.proc.pid, e)
         self._reader_task = asyncio.create_task(self._read_stdout())
         asyncio.create_task(self._read_stderr())
 
@@ -327,22 +335,43 @@ class KimiWireClient:
             # Signal the entire group so the kimi-cli grandchild dies with
             # the node helper — single `terminate()` would only hit node and
             # leave kimi-cli orphaned.
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except OSError as e:
-                log.warning("killpg SIGTERM failed for helper pid=%s: %s", pid, e)
+            if not self._kill_helper_group(signal.SIGTERM):
                 self.proc.terminate()
             try:
                 await asyncio.wait_for(self.proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError:
+                if not self._kill_helper_group(signal.SIGKILL):
                     self.proc.kill()
                 await self.proc.wait()
         if self._reader_task:
             self._reader_task.cancel()
+
+    def _kill_helper_group(self, sig: signal.Signals) -> bool:
+        if not self.proc:
+            return False
+        pgid = self._process_group_id
+        if pgid is None:
+            try:
+                pgid = os.getpgid(self.proc.pid)
+            except OSError as e:
+                log.warning("could not resolve helper process group pid=%s: %s",
+                            self.proc.pid, e)
+                return False
+
+        current_pgid = os.getpgrp()
+        if pgid == current_pgid:
+            log.error(
+                "refusing to signal current process group pgid=%s for helper pid=%s",
+                pgid, self.proc.pid,
+            )
+            return False
+
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return True
+        except OSError as e:
+            log.warning("killpg %s failed for helper pid=%s pgid=%s: %s",
+                        sig.name, self.proc.pid, pgid, e)
+            return False

@@ -112,6 +112,38 @@ RESTORE_VERIFY_TIMEOUT_SEC = _nonnegative_int_env(
     "RESTORE_VERIFY_TIMEOUT_SEC", 15)
 RESTORE_RETRY_BACKOFF_SEC = _nonnegative_int_env(
     "RESTORE_RETRY_BACKOFF_SEC", 60)
+RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC = _nonnegative_int_env(
+    "RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC", 600)
+
+_CMUX_UNHEALTHY_ERROR_PREFIX = "cmux_unhealthy:"
+_CMUX_UNHEALTHY_ERROR_PATTERNS = (
+    "Terminal surface not found",
+    "Tab not found",
+    "Workspace not found",
+    "cmux workspace not available",
+)
+
+
+def _workspace_id(workspace: dict) -> str | None:
+    value = workspace.get("id") or workspace.get("workspace_id")
+    return str(value) if value else None
+
+
+def _is_cmux_unhealthy_restore_error(error: Exception | str | None) -> bool:
+    if error is None:
+        return False
+    text = str(error)
+    if text.startswith(_CMUX_UNHEALTHY_ERROR_PREFIX):
+        return True
+    if isinstance(error, CmuxError):
+        return True
+    return any(pattern in text for pattern in _CMUX_UNHEALTHY_ERROR_PATTERNS)
+
+
+def _restore_backoff_sec(row: SessionRow) -> int:
+    if _is_cmux_unhealthy_restore_error(row.last_backend_error):
+        return RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC
+    return RESTORE_RETRY_BACKOFF_SEC
 
 # Image attachment relay (Discord → kimi).
 # /tmp on macOS is auto-cleaned (com.apple.tmp_cleaner runs daily at 00:00
@@ -191,6 +223,7 @@ class Router:
         self._delivery_wakeup: asyncio.Event | None = None
         self._delivery_lock = asyncio.Lock()
         self._restore_lock = asyncio.Lock()
+        self._cmux_restore_paused_until = 0.0
 
     async def refresh_sleep_guard(self) -> None:
         if self.sleep_guard_mode == "always":
@@ -257,6 +290,10 @@ class Router:
         restored = 0
         async with self._restore_lock:
             now = int(time.time())
+            if now < self._cmux_restore_paused_until:
+                log.debug("restore skipped: cmux restore circuit breaker active "
+                          "for %.0fs", self._cmux_restore_paused_until - now)
+                return 0
             for row in self.registry.list_active():
                 if row.backend not in {"wire", "restoring"} or not row.acp_session_id:
                     continue
@@ -265,7 +302,7 @@ class Router:
                 # surface every RESTORE_WATCH_INTERVAL_SEC ticks and leak
                 # them (cmux saw 2000+ ghost surfaces in one regression).
                 if (row.restore_attempt_at
-                        and now - row.restore_attempt_at < RESTORE_RETRY_BACKOFF_SEC):
+                        and now - row.restore_attempt_at < _restore_backoff_sec(row)):
                     continue
                 thread_id = int(row.thread_id)
                 wire_sess = self.wire_sessions.get(thread_id)
@@ -276,20 +313,32 @@ class Router:
                         restored += 1
                 except Exception as e:
                     log.warning("restore failed for thread=%s: %s", row.thread_id, e)
+                    error = str(e)
+                    cmux_unhealthy = _is_cmux_unhealthy_restore_error(e)
+                    if cmux_unhealthy:
+                        self._cmux_restore_paused_until = (
+                            time.time() + RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC
+                        )
+                        error = f"{_CMUX_UNHEALTHY_ERROR_PREFIX} {error}"
+                        log.warning("cmux restore circuit breaker opened for %ss",
+                                    RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC)
                     self.registry.set_backend(
                         row.thread_id,
                         "wire",
                         surface_id=None,
                         abandoned_surface_id=row.abandoned_surface_id,
-                        last_error=str(e),
+                        last_error=error,
                         restore_attempt_at=int(time.time()),
                     )
+                    if cmux_unhealthy:
+                        break
         return restored
 
     async def _restore_one_wire_session(self, row: SessionRow,
                                         client: discord.Client) -> bool:
         thread_id = int(row.thread_id)
         thread = await self._fetch_thread(client, thread_id)
+        await self._ensure_restore_workspace_available(row.workspace_id)
         self.registry.set_backend(
             row.thread_id,
             "restoring",
@@ -318,11 +367,11 @@ class Router:
             raise RuntimeError("cmux restore created no surface id")
         attached = False
         try:
+            await self._wait_for_surface_ready(surf_id)
             try:
                 await rename_tab(surf_id, _short_tab_title(row.workspace_name, thread.name))
             except Exception as e:
                 log.warning("restore rename_tab failed: %s", e)
-            await self._wait_for_surface_ready(surf_id)
             cmd = (
                 f"cd {shlex.quote(row.cwd)} && "
                 f"KIMI_CLI_NO_AUTO_UPDATE=1 kimi --session "
@@ -371,6 +420,12 @@ class Router:
         except Exception:
             log.exception("restore notice failed for thread %s", row.thread_id)
         return True
+
+    async def _ensure_restore_workspace_available(self, workspace_id: str) -> None:
+        workspaces = await list_workspaces()
+        if any(_workspace_id(ws) == workspace_id for ws in workspaces):
+            return
+        raise RuntimeError(f"cmux workspace not available for restore: {workspace_id}")
 
     async def _wait_for_surface_ready(self, surface_id: str,
                                       timeout: float = 12.0) -> None:

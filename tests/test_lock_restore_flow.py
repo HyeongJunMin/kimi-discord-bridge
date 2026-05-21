@@ -81,6 +81,9 @@ async def test_restore_fails_when_kimi_session_does_not_attach(
     # surface_read_text returns a shell prompt but never the banner with
     # the expected acp_session_id — simulating kimi-cli that never attached.
     with patch.object(
+        bot, "list_workspaces",
+        new=AsyncMock(return_value=[{"id": "ws"}]),
+    ), patch.object(
         bot, "create_surface",
         new=AsyncMock(return_value={"surface_id": "surf-new"}),
     ), patch.object(
@@ -142,6 +145,9 @@ async def test_restore_closes_wire_helper_before_starting_cmux_relay(
         return None
 
     with patch.object(
+        bot, "list_workspaces",
+        new=AsyncMock(return_value=[{"id": "ws"}]),
+    ), patch.object(
         bot, "create_surface",
         new=AsyncMock(return_value={"surface_id": "surf-new"}),
     ), patch.object(
@@ -247,6 +253,9 @@ async def test_restore_closes_new_surface_when_verify_fails(
 
     close_mock = AsyncMock()
     with patch.object(
+        bot, "list_workspaces",
+        new=AsyncMock(return_value=[{"id": "ws"}]),
+    ), patch.object(
         bot, "create_surface",
         new=AsyncMock(return_value={"surface_id": "leaky-surf"}),
     ), patch.object(
@@ -265,6 +274,81 @@ async def test_restore_closes_new_surface_when_verify_fails(
         "otherwise cmux leaks one surface per failed tick"
     )
     assert close_mock.await_args.args[0] == "leaky-surf"
+
+
+async def test_restore_skips_create_when_workspace_is_missing(
+    tmp_sqlite_path, monkeypatch
+):
+    """A stale workspace_id must not be fed into surface.create. That path
+    was producing Workspace not found errors and repeated create attempts."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    router = bot.Router()
+    router.registry.insert(_row(workspace_id="missing-ws"))
+
+    wire_sess = MagicMock()
+    wire_sess.active_turn = False
+    wire_sess.close = AsyncMock()
+    router.wire_sessions[123] = wire_sess
+
+    thread = MagicMock()
+    thread.id = 123
+    thread.name = "kimi-test"
+    client = MagicMock()
+    client.get_channel.return_value = thread
+
+    create_mock = AsyncMock()
+    with patch.object(
+        bot, "list_workspaces",
+        new=AsyncMock(return_value=[{"id": "other-ws"}]),
+    ), patch.object(bot, "create_surface", new=create_mock):
+        restored = await router.restore_wire_sessions_once(client)
+
+    assert restored == 0
+    create_mock.assert_not_awaited()
+    wire_sess.close.assert_not_awaited()
+    row = router.registry.get_by_thread("123")
+    assert row.backend == "wire"
+    assert row.last_backend_error.startswith("cmux_unhealthy:")
+
+
+async def test_cmux_not_found_restore_error_opens_global_circuit_breaker(
+    tmp_sqlite_path, monkeypatch
+):
+    """Once cmux reports an inconsistent surface state, pause all restore
+    attempts instead of creating a new surface for each active wire row."""
+    monkeypatch.setattr(bot, "REGISTRY_PATH", tmp_sqlite_path)
+    monkeypatch.setattr(bot, "RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC", 600)
+    router = bot.Router()
+    router.registry.insert(_row("123"))
+    router.registry.insert(_row("456"))
+
+    thread = MagicMock()
+    thread.id = 123
+    thread.name = "kimi-test"
+    client = MagicMock()
+    client.get_channel.return_value = thread
+
+    create_mock = AsyncMock(return_value={"surface_id": "surf-new"})
+    with patch.object(
+        bot, "list_workspaces",
+        new=AsyncMock(return_value=[{"id": "ws"}]),
+    ), patch.object(
+        bot, "create_surface", new=create_mock
+    ), patch.object(
+        bot, "surface_read_text",
+        new=AsyncMock(side_effect=bot.CmuxError(
+            "cmux rpc surface.read_text failed: Error: not_found: "
+            "Terminal surface not found"
+        )),
+    ), patch.object(
+        bot, "close_surface", new=AsyncMock()
+    ):
+        restored = await router.restore_wire_sessions_once(client)
+        restored_again = await router.restore_wire_sessions_once(client)
+
+    assert restored == 0
+    assert restored_again == 0
+    assert create_mock.await_count == 1
 
 
 async def test_restore_worker_honors_backoff_after_failure(
@@ -385,60 +469,81 @@ def test_find_orphan_wire_pids_ignores_malformed_lines():
     assert pids == []
 
 
-async def test_wire_client_stop_kills_grandchild_processes(tmp_path):
-    """Regression: when bot shutdown calls KimiWireClient.stop(), any
-    kimi-cli grandchildren the node helper spawned must die too.
+async def test_wire_client_stop_signals_helper_process_group(monkeypatch):
+    """Unit-level regression for the orphan-helper bug.
 
-    Reproducing the prod incident: a hard-killed bot left a node helper
-    (PPID=1) and its kimi-cli child both running. Same acp_session_id was
-    later resumed by cmux → two clients on one session → duplicate Discord
-    replies.
-
-    We stand in a tiny bash 'helper' that spawns a sleep grandchild and
-    prints both pids on stdout. stop() must terminate the whole pgrp.
+    The old test spawned real processes and then exercised os.killpg, which
+    can kill the pytest/Claude process group if process-group isolation ever
+    regresses. Keep this as a pure unit test: verify that stop() targets the
+    stored helper pgid, without sending a real signal.
     """
-    import os
     import signal as _signal
 
-    fake_helper = tmp_path / "fake_helper.sh"
-    fake_helper.write_text(
-        "#!/usr/bin/env bash\n"
-        "sleep 60 &\n"
-        "child=$!\n"
-        "echo \"$$ $child\"\n"  # parent pid, child pid
-        "wait\n"
-    )
-    fake_helper.chmod(0o755)
+    class FakeProc:
+        pid = 12345
+        returncode = None
 
-    client = KimiWireClient(command=["/bin/bash", str(fake_helper)])
-    await client.start()
-    assert client.proc and client.proc.stdout
+        def terminate(self):
+            raise AssertionError("terminate fallback should not be used")
 
-    line = await asyncio.wait_for(client.proc.stdout.readline(), timeout=5)
-    parts = line.decode().split()
-    helper_pid, grandchild_pid = int(parts[0]), int(parts[1])
+        def kill(self):
+            raise AssertionError("kill fallback should not be used")
 
-    def alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+        async def wait(self):
+            self.returncode = -int(_signal.SIGTERM)
+            return self.returncode
 
-    assert alive(helper_pid)
-    assert alive(grandchild_pid)
+    calls: list[tuple[int, _signal.Signals]] = []
+
+    def fake_killpg(pgid: int, sig: _signal.Signals):
+        calls.append((pgid, sig))
+
+    monkeypatch.setattr("router.kimi_wire.os.killpg", fake_killpg)
+    monkeypatch.setattr("router.kimi_wire.os.getpgrp", lambda: 11111)
+
+    client = KimiWireClient(command=["unused"])
+    client.proc = FakeProc()
+    client._process_group_id = 54321
 
     await client.stop()
-    await asyncio.sleep(0.3)
 
-    assert not alive(helper_pid), (
-        f"helper pid={helper_pid} survived stop()")
-    assert not alive(grandchild_pid), (
-        f"grandchild pid={grandchild_pid} (kimi-cli analogue) survived stop() — "
-        f"orphans like this caused the production duplicate-response bug"
-    )
+    assert calls == [(54321, _signal.SIGTERM)]
+
+
+async def test_wire_client_stop_refuses_to_signal_own_process_group(monkeypatch):
+    """Safety guard: if process-group isolation fails, stop() must not call
+    killpg() on the current pytest/Claude process group."""
+    import signal as _signal
+
+    class FakeProc:
+        pid = 12345
+        returncode = None
+        terminated = False
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -int(_signal.SIGTERM)
+
+        def kill(self):
+            raise AssertionError("kill fallback should not be used")
+
+        async def wait(self):
+            return self.returncode
+
+    def fake_killpg(*_args):
+        raise AssertionError("must not signal current process group")
+
+    monkeypatch.setattr("router.kimi_wire.os.killpg", fake_killpg)
+    monkeypatch.setattr("router.kimi_wire.os.getpgrp", lambda: 54321)
+
+    proc = FakeProc()
+    client = KimiWireClient(command=["unused"])
+    client.proc = proc
+    client._process_group_id = 54321
+
+    await client.stop()
+
+    assert proc.terminated
 
 
 async def test_kimi_wire_client_uses_absolute_node_when_path_is_bare(

@@ -65,9 +65,13 @@ Discord → bot.py → kimi_wire.KimiWireClient → kimi_wire_bridge.mjs → @mo
         ← (assistant/tool 이벤트) ←
 ```
 잠금이 풀리면 `bot.py` 의 restore worker(`RESTORE_WATCH_INTERVAL_SEC` 주기)
-가 새 cmux surface 를 만들고 `kimi --session <session_id>` 를 실행해 같은
-세션을 cmux 경로로 되돌린다. 중간에 surface 가 누락되거나 응답이 중복되는
-경우를 막기 위한 lease/dedup 로직이 함께 동작한다.
+가 workspace 상태를 먼저 확인하고, 새 cmux surface 가 실제로 읽히는지
+검증한 뒤 `kimi --session <session_id>` 를 실행해 같은 세션을 cmux 경로로
+되돌린다. cmux 가 `Terminal surface not found`, `Tab not found`,
+`Workspace not found` 같은 불일치 오류를 내면
+`RESTORE_CMUX_UNHEALTHY_BACKOFF_SEC` 동안 restore 생성을 멈춰 surface 폭증을
+막는다. 중간에 surface 가 누락되거나 응답이 중복되는 경우를 막기 위한
+lease/dedup 로직도 함께 동작한다.
 
 ## 메시지 dedup & 큐
 - 인바운드 Discord 메시지는 `inbound_messages` 테이블에 `pending` 으로 저장된 뒤 worker 가 cmux/wire 로 전달한다.
