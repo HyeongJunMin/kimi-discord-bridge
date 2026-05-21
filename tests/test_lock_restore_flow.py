@@ -318,33 +318,35 @@ def test_singleton_lock_reusable_after_release(tmp_path):
 
 
 def test_run_bot_sh_refuses_when_router_bot_is_running(tmp_path):
-    """Shell-level guard: pgrep finds an existing router.bot → script exits
-    non-zero before exec'ing python. Sanity check that the guard is wired
-    correctly (the grep pattern matches the real argv form)."""
+    """Shell-level guard: when pgrep reports a running router.bot, run-bot.sh
+    exits non-zero with 'already running' before exec'ing python. Uses a fake
+    pgrep on PATH so the test doesn't depend on macOS's real pgrep (which can
+    fail with 'sysmond service not found' under TCC restrictions)."""
     import subprocess
-    decoy = subprocess.Popen(
-        ["bash", "-c", "exec -a 'python -m router.bot' sleep 60"],
+    import os
+    import stat
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pgrep = fake_bin / "pgrep"
+    # Mimic real pgrep: rc=0 with a matching pid printed when -f given.
+    fake_pgrep.write_text(
+        "#!/bin/sh\n"
+        "echo 99999 python -m router.bot\n"
+        "exit 0\n"
     )
-    try:
-        # Give pgrep a moment to see the renamed argv.
-        import time as _time
-        _time.sleep(0.2)
-        result = subprocess.run(
-            ["bash", "run-bot.sh"],
-            cwd=str(__import__("pathlib").Path(__file__).parent.parent),
-            capture_output=True, text=True, timeout=5,
-        )
-        assert result.returncode != 0, (
-            f"run-bot.sh must refuse to start when router.bot is alive; "
-            f"got rc={result.returncode}, stderr={result.stderr!r}"
-        )
-        assert "already running" in result.stderr
-    finally:
-        decoy.terminate()
-        try:
-            decoy.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            decoy.kill()
+    fake_pgrep.chmod(fake_pgrep.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    result = subprocess.run(
+        ["bash", "run-bot.sh"],
+        cwd=str(__import__("pathlib").Path(__file__).parent.parent),
+        capture_output=True, text=True, timeout=5, env=env,
+    )
+    assert result.returncode != 0, (
+        f"run-bot.sh must refuse to start when pgrep reports router.bot is alive; "
+        f"got rc={result.returncode}, stderr={result.stderr!r}"
+    )
+    assert "already running" in result.stderr
 
 
 def test_find_orphan_wire_pids_detects_helper_and_orphan_kimi():

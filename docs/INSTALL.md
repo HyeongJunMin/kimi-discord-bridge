@@ -150,6 +150,36 @@ grep -E '^MOONSHOT_API_KEY=' .env && echo "❌ .env 에 MOONSHOT_API_KEY 라인�
 
 ---
 
+## 단계 6.5 — Mac 전원 설정 (잠금 상태에서도 봇이 동작하도록)
+
+> 이 봇은 Mac 이 깨어 있어야 동작합니다. 잠금/디스플레이 꺼짐은 허용되지만 system sleep 상태에서는 Discord 메시지를 실시간 처리할 수 없습니다. **봇과 macOS 토글 두 레이어를 같이 켜는 것이 표준 구성입니다.**
+
+### 도구가 사용자에게 안내
+
+**시스템 설정 → 배터리 → 옵션** 을 열고 다음 토글을 **ON** 으로:
+- **"디스플레이가 꺼져 있을 때 전원 어댑터 사용 시 컴퓨터를 자동으로 잠자지 않게 하기"**
+
+이게 켜져 있어야 봇이 일시적으로 죽었을 때도 Mac 이 깨어 있어 자동 재시작 / 원격 ssh 가 가능합니다. 켜져 있지 않으면 봇 다운 = Mac sleep = 외출 중 무방비.
+
+전원 어댑터를 항상 연결해두는 운영 (책상 위, 클램쉘 등) 을 권장합니다. 배터리 사용 중에는 위 토글이 작동하지 않습니다.
+
+`SLEEP_GUARD_MODE=always` (단계 5 에서 `.env` 에 이미 설정됨) 는 봇 실행 중 `caffeinate -imsu` 를 띄워 같은 효과를 코드 레벨에서 보장합니다. 두 레이어를 같이 켜는 게 표준.
+
+### 도구가 (자기 Bash 로) 검증
+
+```bash
+pmset -g | grep -E "^\s+(sleep|displaysleep)\s"
+```
+- `sleep` 값이 `0` 이거나 (= 절대 sleep 안 함) `sleep 0 (sleep prevented by ...)` 라고 표시되면 OK.
+- 그 외 양수 (예: `sleep 10`) 가 보이면 위 GUI 토글이 꺼져 있을 가능성. 사용자에게 다시 확인 요청.
+
+### 분기
+
+- 토글이 안 보임 → macOS 버전 차이. 시스템 설정 → 잠금 화면 / 에너지 절약 등 비슷한 카테고리에서 "디스플레이 꺼짐 시 sleep" 관련 옵션을 찾는다.
+- 데스크탑 Mac (배터리 없음) 이면 같은 옵션이 시스템 설정 → 에너지 절약 에 있고 라벨이 다를 수 있다. 핵심은 "디스플레이 sleep 은 허용하되 시스템 sleep 은 막는다" 는 동작.
+
+---
+
 ## 단계 7 — 봇 첫 실행 (사용자가 직접 실행, 토큰 1회 입력)
 
 > ⚠️ **이 단계만 도구가 실행하지 않고 사용자에게 양도한다.** 이유: 비밀 입력 프롬프트는 사용자 터미널의 TTY 가 필요하고, 더 중요하게는 토큰값이 도구 컨텍스트에 흘러들어가지 않도록 사용자가 자기 터미널에 직접 타이핑해야 한다.
@@ -205,6 +235,7 @@ tail -5 bot.log | grep "bot online"        # 로그에 online 라인
 
 ### 분기
 - 스레드는 생겼는데 응답이 안 옴 → cmux 창에서 해당 surface를 열어 kimi-cli TUI가 정상 동작하는지 직접 확인. 첫 메시지의 wire.jsonl 생성에는 시간이 좀 걸릴 수 있으므로 60초 정도 기다린다.
+- 잠금 상태에서 cmux 가 surface 를 만들지 못해 응답이 비어 있으면, 봇이 자동으로 `kimi --wire` SDK fallback 으로 전환해 동일 session id 로 답을 준다. 잠금이 풀리면 restore worker(`RESTORE_WATCH_INTERVAL_SEC` 주기)가 다시 cmux surface 로 복구한다. `/status` 에 `wire fallback` 상태가 표시됨.
 - `cmux 호출 실패` → 단계 6 다시.
 - `워크스페이스 선택`이 안 뜨고 에러 → 봇 로그 확인.
 
@@ -302,10 +333,16 @@ launchctl load ~/Library/LaunchAgents/com.kimi-bridge.plist
 | `DISCORD_GUILD_ID` | | — | 설정 시 해당 길드에만 명령을 sync (빠름, 권장) |
 | `DEFAULT_WORK_DIR` | | `$HOME` | 새 워크스페이스의 기본 cwd |
 | `CMUX_CMD` | | `cmux` | cmux 바이너리 경로 (PATH에 없을 때만 절대경로 지정) |
-| `SESSION_DB_PATH` | | `router.sqlite3` | 세션 메타데이터 sqlite 파일 |
-| `SLEEP_GUARD_MODE` | | `off` | `off`, `active_sessions`, `always`. `always`는 브릿지 실행 중 항상 `caffeinate -imsu`를 유지해 외부 `/new` 대기 상태에 적합 |
+| `SESSION_DB_PATH` | | `sessions.sqlite3` | 세션 메타데이터 sqlite 파일. 과거 `sessions.json`(실제로는 SQLite) 파일이 있으면 부팅 시 자동으로 이 이름으로 rename 됨 |
+| `SLEEP_GUARD_MODE` | | `off` | `off`, `active_sessions`, `always`. `always`는 브릿지 실행 중 항상 `caffeinate -imsu`를 유지해 외부 `/new` 대기 상태에 적합. **단계 6.5 의 macOS GUI 토글과 같이 켜는 게 표준** — 봇이 죽었을 때도 Mac 이 깨어 있어야 자동 재시작/ssh 가 가능 |
 | `QUEUE_MAX_MESSAGE_AGE_SEC` | | `300` | Discord 원본 작성 시각 기준 이 값보다 오래된 메시지는 wake 후 자동 실행하지 않고 `skipped_stale` 처리. `0`이면 비활성 |
 | `PREVENT_SLEEP_WHILE_ACTIVE` | | `0` | 기존 호환용. `SLEEP_GUARD_MODE`가 없고 이 값이 `1`이면 `active_sessions`로 해석 |
+| `RESTORE_WATCH_INTERVAL_SEC` | | `5` | wire fallback 으로 떠 있는 세션을 cmux surface 로 복구 시도하는 주기(초). `0` 이면 restore worker 비활성 (자동 복구 안 함, `/attach` 로 수동 복구만 가능) |
+| `KIMI_WIRE_BRIDGE_CMD` | | `node router/kimi_wire_bridge.mjs` | wire fallback helper 실행 명령 override. 별도 위치에 helper 를 두거나 node 옵션을 끼울 때만 사용 |
+| `KIMI_NODE_CMD` | | (PATH 의 `node`) | wire fallback helper 가 쓸 node 바이너리. PATH 에서 못 찾거나 특정 버전을 강제할 때 절대경로 지정 |
+| `KIMI_WIRE_SHOW_TOOLS` | | `0` | `1`/`true` 면 wire fallback 의 도구 호출 이벤트도 Discord 로 surface (디버그용) |
+| `KIMI_WIRE_SHOW_THINKING` | | `0` | `1`/`true` 면 wire fallback 의 thinking 토큰 스트림도 Discord 로 surface (디버그용) |
+| `BOT_PID_FILE` | | `router.bot.pid` | 봇 싱글톤 락 파일 경로. 같은 호스트에서 동시 다중 인스턴스 방지용 |
 
 ---
 
@@ -338,5 +375,8 @@ launchctl load ~/Library/LaunchAgents/com.kimi-bridge.plist
    ```
    `<UUID>` 는 봇 로그 `/attach: scanning ... registered={...}` 라인에서 확인.
 
-**Q. `.env.example` 의 `KIMI_CMD`, `DISCORD_CLIENT_ID` 는 뭐냐.**
-주석으로 비활성화되어 있다 (코드가 직접 읽지 않음). `KIMI_CMD` 는 향후 kimi 바이너리 경로를 환경별로 분리하고 싶을 때를 위한 자리, `DISCORD_CLIENT_ID` 는 단계 3 의 OAuth2 URL 을 직접 만들고 싶을 때 참고용이다. 봇 동작에는 영향이 없다.
+**Q. `.env.example` 의 `DISCORD_CLIENT_ID` 는 뭐냐.**
+주석으로 비활성화되어 있다 (코드가 직접 읽지 않음). 단계 3 의 OAuth2 URL 을 직접 만들고 싶을 때 참고용이다. 봇 동작에는 영향이 없다.
+
+**Q. 같은 메시지가 두 번 처리되거나, 같은 답변이 두 번 오는 경우.**
+인바운드 측은 `inbound_message_dedup` 테이블이 같은 Discord message id 의 두 번째 처리를 차단한다 (Discord 의 webhook 재시도/봇 재시작 중 중복 수신 대응). 아웃바운드 측은 cmux↔wire 전환 구간의 lease 로 중복 응답을 막는다. 그래도 중복이 보이면 봇 로그의 `dedup` / `lease` 라인을 확인하라.

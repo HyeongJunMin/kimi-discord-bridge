@@ -195,6 +195,9 @@ class KimiWireSession:
     async def close(self) -> None:
         await self.client.close(self.name)
 
+    async def interrupt(self) -> None:
+        await self.client.interrupt(self.name)
+
 
 class KimiWireClient:
     def __init__(self, command: list[str] | None = None):
@@ -305,6 +308,13 @@ class KimiWireClient:
 
     async def close(self, name: str) -> None:
         queue = await self._send({"op": "close", "name": name})
+        msg = await queue.get()
+        self._pending.pop(msg.get("id", -1), None)
+        if msg.get("error"):
+            raise KimiWireError(str(msg["error"]))
+
+    async def interrupt(self, name: str) -> None:
+        queue = await self._send({"op": "interrupt", "name": name})
         msg = await queue.get()
         self._pending.pop(msg.get("id", -1), None)
         if msg.get("error"):

@@ -35,7 +35,34 @@ log = logging.getLogger("router.bot")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-REGISTRY_PATH = os.environ.get("SESSION_DB_PATH", "router.sqlite3")
+REGISTRY_PATH = os.environ.get("SESSION_DB_PATH", "sessions.sqlite3")
+
+
+def _migrate_legacy_db_path(path: str) -> None:
+    """Rename legacy sessions.json (which was actually SQLite, not JSON) to the
+    configured path on startup. Scoped to the *same directory* as the target
+    path — an explicit SESSION_DB_PATH override pointing elsewhere (e.g. tests
+    with /tmp paths) must not drag the user's real DB out from under them."""
+    if os.path.exists(path):
+        return
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    legacy = os.path.join(target_dir, "sessions.json")
+    if not os.path.exists(legacy):
+        return
+    if os.path.abspath(legacy) == os.path.abspath(path):
+        return
+    try:
+        with open(legacy, "rb") as f:
+            header = f.read(16)
+    except OSError:
+        return
+    if not header.startswith(b"SQLite format 3"):
+        return
+    os.rename(legacy, path)
+    log.warning("migrated legacy sessions.json -> %s", path)
+
+
+_migrate_legacy_db_path(REGISTRY_PATH)
 GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.environ.get("DISCORD_GUILD_ID") else None
 DEFAULT_WORK_DIR = os.environ.get("DEFAULT_WORK_DIR", os.path.expanduser("~"))
 SLEEP_GUARD_MODES = {"off", "active_sessions", "always"}
@@ -211,6 +238,9 @@ class Router:
                 pass
 
     async def _restore_worker(self, client: discord.Client) -> None:
+        if RESTORE_WATCH_INTERVAL_SEC <= 0:
+            log.info("restore worker disabled (RESTORE_WATCH_INTERVAL_SEC=0)")
+            return
         while True:
             try:
                 restored = await self.restore_wire_sessions_once(client)
@@ -221,7 +251,7 @@ class Router:
                 raise
             except Exception:
                 log.exception("restore worker iteration failed")
-            await asyncio.sleep(max(1, RESTORE_WATCH_INTERVAL_SEC))
+            await asyncio.sleep(RESTORE_WATCH_INTERVAL_SEC)
 
     async def restore_wire_sessions_once(self, client: discord.Client) -> int:
         restored = 0
@@ -1127,15 +1157,31 @@ async def stop_cmd(interaction: discord.Interaction):
     if str(interaction.user.id) != row.owner_user_id:
         await interaction.response.send_message("세션 소유자만 사용할 수 있어요.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
+
+    # wire backend: route to KimiWireSession.interrupt() instead of cmux ESC.
+    if row.backend == "wire":
+        wire_sess = router.wire_sessions.get(interaction.channel.id)
+        if not wire_sess:
+            await interaction.followup.send(
+                "wire 세션 객체를 찾을 수 없어요.", ephemeral=True)
+            return
+        try:
+            await wire_sess.interrupt()
+            await interaction.followup.send("⏹ wire interrupt 전송 완료", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(
+                f"⚠️ wire interrupt 실패: {e}", ephemeral=True)
+        return
+
     sess = router.sessions.get(interaction.channel.id)
     if not sess:
-        await interaction.response.send_message("세션 객체를 찾을 수 없어요.", ephemeral=True)
+        await interaction.followup.send("세션 객체를 찾을 수 없어요.", ephemeral=True)
         return
     # Send raw ESC (no newline) directly to the surface. Bypassing
     # send_to_surface keeps us from appending '\n' (which would commit a
     # blank line instead of cancelling) and from triggering the tail-start
     # path (already started by the time user can /stop).
-    await interaction.response.defer(ephemeral=True)
     try:
         await surface_send_text(sess.surface_id, "\x1b")
         await interaction.followup.send("⏹ ESC 전송 완료", ephemeral=True)
@@ -1256,6 +1302,21 @@ async def attach_cmd(interaction: discord.Interaction):
         r.monitor_surface_id for r in router.registry.list_active()
         if r.monitor_surface_id
     }
+    # Whitelist: when this thread has an active row but no in-memory session
+    # (zombie after bot restart — see f9fdfd2), allow re-attaching to *that
+    # thread's own* surface. Other threads' attached surfaces stay protected
+    # against duplicate tails (see 0e5783f).
+    allowed_zombie_surface: str | None = None
+    if is_thread:
+        thread_row = router.registry.get_by_thread(str(ch.id))
+        if (thread_row
+                and thread_row.status == "active"
+                and thread_row.monitor_surface_id
+                and ch.id not in router.sessions):
+            allowed_zombie_surface = thread_row.monitor_surface_id
+            registered_surface_ids.discard(allowed_zombie_surface)
+            log.info("/attach: whitelisting zombie surface %s for thread %s",
+                     allowed_zombie_surface, ch.id)
     # Process-level ground truth: a surface is only a real kimi candidate
     # if its tty is currently owned by a kimi-cli process. We get this by
     # joining cmux's system.tree (surface → tty) with `ps` output (kimi-cli
