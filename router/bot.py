@@ -869,7 +869,16 @@ async def new_session_cmd(interaction: discord.Interaction):
                 f"이 스레드에서: `/stop` 응답 멈춤 · `/kill` 세션 종료")
         except Exception as e:
             log.exception("session start failed")
-            await thread.send(f"⚠️ 세션 시작 실패: `{e}`")
+            await thread.send(
+                f"⚠️ 세션 시작 실패: `{e}`\n"
+                f"이 thread는 보관 처리됩니다. `/new`로 다시 시작하세요.")
+            # No registry row was written, so this thread is orphaned. Archive
+            # it so it drops out of the active list instead of lingering as a
+            # zombie that /status can't explain.
+            try:
+                await thread.edit(archived=True)
+            except Exception:
+                log.warning("failed to archive orphan thread %s", thread.id)
 
     select.callback = on_select
     view = discord.ui.View(timeout=120)

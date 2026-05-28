@@ -30,6 +30,11 @@ MAX_DISCORD_MESSAGE = 1900
 _SHOW_TOOLS = os.environ.get("KIMI_WIRE_SHOW_TOOLS", "").lower() in {"1", "true", "yes"}
 _SHOW_THINKING = os.environ.get("KIMI_WIRE_SHOW_THINKING", "").lower() in {"1", "true", "yes"}
 
+# Request/response ops (start, close, interrupt) must get a reply quickly.
+# `prompt` is a streaming op that can legitimately run for minutes, so it is
+# never bounded by this timeout — it relies on helper-death detection instead.
+_DEFAULT_HANDSHAKE_TIMEOUT = float(os.environ.get("KIMI_WIRE_HANDSHAKE_TIMEOUT", "30"))
+
 # Common absolute paths where `node` lives on macOS dev machines. Tried in
 # order when PATH does not contain node — happens whenever the bot is
 # launched from a stock-PATH shell (launchd, `nohup ./run-bot.sh`) that
@@ -213,6 +218,7 @@ class KimiWireClient:
         self._reader_task: asyncio.Task | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Queue[dict[str, Any]]] = {}
+        self._handshake_timeout = _DEFAULT_HANDSHAKE_TIMEOUT
 
     async def start(self) -> None:
         if self.proc and self.proc.returncode is None:
@@ -242,16 +248,27 @@ class KimiWireClient:
 
     async def _read_stdout(self) -> None:
         assert self.proc and self.proc.stdout
-        async for raw in self.proc.stdout:
-            try:
-                msg = json.loads(raw.decode())
-            except Exception:
-                log.warning("invalid Kimi wire helper output: %r", raw)
-                continue
-            req_id = msg.get("id")
-            queue = self._pending.get(req_id)
-            if queue:
-                await queue.put(msg)
+        try:
+            async for raw in self.proc.stdout:
+                try:
+                    msg = json.loads(raw.decode())
+                except Exception:
+                    log.warning("invalid Kimi wire helper output: %r", raw)
+                    continue
+                req_id = msg.get("id")
+                queue = self._pending.get(req_id)
+                if queue:
+                    await queue.put(msg)
+        finally:
+            # stdout EOF (or reader cancellation) means the helper is gone:
+            # wake every in-flight waiter so they raise instead of hanging
+            # forever on queue.get(). Without this a dead helper turns a
+            # /new session start into a silent zombie thread.
+            self._fail_all_pending("Kimi wire helper exited")
+
+    def _fail_all_pending(self, reason: str) -> None:
+        for queue in list(self._pending.values()):
+            queue.put_nowait({"error": reason})
 
     async def _read_stderr(self) -> None:
         assert self.proc and self.proc.stderr
@@ -269,13 +286,27 @@ class KimiWireClient:
         self._pending[req_id] = queue
         self.proc.stdin.write((json.dumps(payload) + "\n").encode())
         await self.proc.stdin.drain()
-        return queue
+        return req_id, queue
+
+    async def _reply(self, req_id: int, queue: asyncio.Queue[dict[str, Any]],
+                     timeout: float) -> dict[str, Any]:
+        """Await a single reply for a request/response op, bounded by `timeout`.
+
+        On timeout the pending entry is dropped and a KimiWireError is raised so
+        callers fail fast instead of blocking on an unresponsive helper."""
+        try:
+            return await asyncio.wait_for(queue.get(), timeout)
+        except asyncio.TimeoutError:
+            raise KimiWireError(
+                f"Kimi wire helper did not reply within {timeout:g}s")
+        finally:
+            self._pending.pop(req_id, None)
 
     async def create_session(self, *, name: str, work_dir: str,
                              session_id: str | None = None,
                              model: str | None = None,
                              yolo: bool | None = None) -> KimiWireSession:
-        queue = await self._send({
+        req_id, queue = await self._send({
             "op": "start",
             "name": name,
             "workDir": work_dir,
@@ -283,26 +314,23 @@ class KimiWireClient:
             "model": model,
             "yolo": yolo,
         })
-        msg: dict[str, Any] = {}
-        try:
-            msg = await queue.get()
-            if msg.get("error"):
-                raise KimiWireError(str(msg["error"]))
-            sid = msg.get("sessionId")
-            if not isinstance(sid, str) or not sid:
-                raise KimiWireError("Kimi wire helper returned no sessionId")
-            return KimiWireSession(name=name, session_id=sid,
-                                   work_dir=work_dir, client=self)
-        finally:
-            self._pending.pop(msg.get("id", -1), None)
+        msg = await self._reply(req_id, queue, self._handshake_timeout)
+        if msg.get("error"):
+            raise KimiWireError(str(msg["error"]))
+        sid = msg.get("sessionId")
+        if not isinstance(sid, str) or not sid:
+            raise KimiWireError("Kimi wire helper returned no sessionId")
+        return KimiWireSession(name=name, session_id=sid,
+                               work_dir=work_dir, client=self)
 
     async def prompt(self, name: str, content: str):
-        queue = await self._send({"op": "prompt", "name": name, "content": content})
-        req_id: int | None = None
+        req_id, queue = await self._send(
+            {"op": "prompt", "name": name, "content": content})
         try:
             while True:
+                # No timeout: a turn can legitimately run for minutes. A dead
+                # helper is surfaced via _fail_all_pending injecting an error.
                 msg = await queue.get()
-                req_id = msg.get("id")
                 if msg.get("event"):
                     yield msg["event"]
                     continue
@@ -311,20 +339,17 @@ class KimiWireClient:
                 if msg.get("done"):
                     break
         finally:
-            if req_id is not None:
-                self._pending.pop(req_id, None)
+            self._pending.pop(req_id, None)
 
     async def close(self, name: str) -> None:
-        queue = await self._send({"op": "close", "name": name})
-        msg = await queue.get()
-        self._pending.pop(msg.get("id", -1), None)
+        req_id, queue = await self._send({"op": "close", "name": name})
+        msg = await self._reply(req_id, queue, self._handshake_timeout)
         if msg.get("error"):
             raise KimiWireError(str(msg["error"]))
 
     async def interrupt(self, name: str) -> None:
-        queue = await self._send({"op": "interrupt", "name": name})
-        msg = await queue.get()
-        self._pending.pop(msg.get("id", -1), None)
+        req_id, queue = await self._send({"op": "interrupt", "name": name})
+        msg = await self._reply(req_id, queue, self._handshake_timeout)
         if msg.get("error"):
             raise KimiWireError(str(msg["error"]))
 

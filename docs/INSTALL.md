@@ -276,6 +276,21 @@ tail -5 bot.log | grep "bot online"        # 로그에 online 라인
 | 스레드 이름 + cmux 탭 이름 동시 변경 | `/rename <새 이름>` |
 | 봇을 잠깐 내렸다 다시 띄울 때 (세션 복구) | cmux surface 는 살아있으므로 같은 스레드에서 `/attach` |
 
+### Claude Code 스킬 활성화 (선택, 권장)
+
+저장소에는 봇 라이프사이클(start / status / stop) 을 한 슬래시 명령으로 제어하는 Claude Code 스킬이 동봉되어 있습니다 (`docs/skills/kimi-bridge/SKILL.md`). Claude Code 사용자는 이 스킬을 글로벌 스킬 폴더로 복사하면 어디서든 `/kimi-bridge` 로 봇을 다룰 수 있습니다.
+
+```bash
+mkdir -p ~/.claude/skills/kimi-bridge
+cp docs/skills/kimi-bridge/SKILL.md ~/.claude/skills/kimi-bridge/SKILL.md
+```
+
+새 Claude Code 세션을 시작하면 `/kimi-bridge` 가 인식됩니다. 호출 시 AskUserQuestion 으로 Status / Start / Stop 중 선택하면 해당 동작을 수행합니다.
+
+**주의**: 스킬 안의 프로젝트 경로(`/Users/minhyeongjun/IdeaProjects/kimi-hub/kimi-discord-bridge-acp`) 는 작성자 환경 기준입니다. 본인 클론 경로로 바꿔야 동작합니다 — `SKILL.md` 내 "Constants" 섹션과 모든 `cd` 라인을 수정.
+
+---
+
 ### launchd 자동 시작 (선택)
 
 `~/Library/LaunchAgents/com.kimi-bridge.plist` 생성:

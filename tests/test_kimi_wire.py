@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from router.kimi_wire import KimiWireSession, _split_message
+import pytest
+
+from router.kimi_wire import KimiWireClient, KimiWireError, KimiWireSession, _split_message
+
+
+class _FakeStdin:
+    def write(self, _data):
+        pass
+
+    async def drain(self):
+        pass
+
+
+def _client_without_helper():
+    """A client whose helper is 'running' but whose reader never delivers a
+    reply — exercises the timeout / death paths without spawning node."""
+    c = KimiWireClient(command=["true"])
+
+    async def _noop_start():
+        return None
+
+    c.start = _noop_start  # type: ignore[assignment]
+    c.proc = SimpleNamespace(stdin=_FakeStdin(), stdout=None, returncode=None)
+    return c
 
 
 class FakeWireClient:
@@ -109,6 +134,34 @@ async def test_wire_session_prompt_ignores_mcp_loading_parse_errors():
 
     sent = [call.args[0] for call in thread.send.await_args_list]
     assert sent == ["done"]
+
+
+async def test_create_session_raises_on_handshake_timeout():
+    """An unresponsive helper must fail fast, not hang the /new flow forever."""
+    c = _client_without_helper()
+    c._handshake_timeout = 0.05
+
+    with pytest.raises(KimiWireError):
+        await c.create_session(name="s", work_dir="/tmp")
+    assert c._pending == {}
+
+
+async def test_create_session_raises_when_helper_dies_mid_wait():
+    """If the helper exits while a request is in flight, the waiter must be
+    woken with an error instead of blocking on queue.get() forever."""
+    c = _client_without_helper()
+    c._handshake_timeout = 5
+
+    task = asyncio.create_task(c.create_session(name="s", work_dir="/tmp"))
+    # Let create_session register its pending queue and block on the reply.
+    while not c._pending:
+        await asyncio.sleep(0)
+
+    c._fail_all_pending("Kimi wire helper exited")
+
+    with pytest.raises(KimiWireError):
+        await task
+    assert c._pending == {}
 
 
 async def test_wire_session_prompt_reports_questions():

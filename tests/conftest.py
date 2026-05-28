@@ -1,5 +1,14 @@
 """Shared pytest fixtures.
 
+⚠️  RUNNING TESTS — READ THIS (applies to Claude Code AND kimi):
+    Plain `pytest` is safe: it excludes `@pytest.mark.slow` tests and caps each
+    test at 60s (see pytest.ini). Do NOT override `-m "not slow"` to run the
+    whole suite at once — the slow tests spawn real OS processes and the
+    combined run has SIGKILLed the sandbox (exit 137), killing the session.
+    To exercise slow tests, run ONE FILE at a time:
+        pytest -m slow tests/test_lock_restore_flow.py
+    Or cover everything file-by-file via:  bash tests/run-safe.sh
+
 Importantly: we set env vars that `router.bot` reads at *module import time*
 (SESSION_DB_PATH, DISCORD_GUILD_ID) BEFORE any test imports the module.
 Otherwise the bot would open a sqlite file in the repo cwd as a side effect.

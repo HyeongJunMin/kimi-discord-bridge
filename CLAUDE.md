@@ -52,3 +52,20 @@ nohup ./run-bot.sh > bot.log 2>&1 &
 - 사용자가 `git status` 로 진행 상황을 한눈에 보길 원함. unstaged 로 방치 금지.
 - 커밋은 사용자가 명시 요청할 때만. `git add -A` / `git add .` 금지 (원치 않는
   파일 포함 위험).
+
+## 테스트 실행 — 절대 전체 한 방 금지
+
+전체 테스트를 한 프로세스(`pytest`로 모든 파일 동시)에서 돌리면 실제 OS
+프로세스를 띄우는 slow 테스트 + 파일별 asyncio 루프가 누적돼 샌드박스 메모리
+천장을 치고 **SIGKILL(exit 137) 로 세션 자체가 죽습니다.** Claude Code·kimi
+어디서 작업하든 동일.
+
+- **기본 실행은 안전**: `pytest` 는 `pytest.ini` 의 `-m "not slow"` + `--timeout=60`
+  덕에 slow 테스트 제외·테스트당 60s 상한이 걸려 있음. 그냥 `pytest` 는 OK.
+- **slow 테스트는 파일 하나씩만**: `pytest -m slow tests/test_lock_restore_flow.py`.
+  여러 파일을 `-m slow` 로 한꺼번에 돌리지 말 것.
+- **전체 커버리지가 필요하면**: `bash tests/run-safe.sh` (파일을 순차로 1개씩
+  실행해 메모리 누적 방지). 절대 `pytest`(전체) + `-m ""`/`-m slow` 조합으로
+  한 방에 돌리지 말 것.
+- `pytest-timeout` 필요 (`requirements-dev.txt` 에 포함). venv 에 없으면
+  `--timeout` addopts 때문에 모든 실행이 깨지므로 `pip install -r requirements-dev.txt`.

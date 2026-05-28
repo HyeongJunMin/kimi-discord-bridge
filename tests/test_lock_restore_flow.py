@@ -401,6 +401,7 @@ def test_singleton_lock_reusable_after_release(tmp_path):
     fh2.close()
 
 
+@pytest.mark.slow  # spawns `bash run-bot.sh`; see pytest.ini — run one file at a time
 def test_run_bot_sh_refuses_when_router_bot_is_running(tmp_path):
     """Shell-level guard: when pgrep reports a running router.bot, run-bot.sh
     exits non-zero with 'already running' before exec'ing python. Uses a fake
@@ -546,6 +547,7 @@ async def test_wire_client_stop_refuses_to_signal_own_process_group(monkeypatch)
     assert proc.terminated
 
 
+@pytest.mark.slow  # spawns a real node helper; see pytest.ini — run one file at a time
 async def test_kimi_wire_client_uses_absolute_node_when_path_is_bare(
     monkeypatch, tmp_path
 ):

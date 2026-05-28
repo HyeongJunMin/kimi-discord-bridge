@@ -2,3 +2,4 @@
 pytest>=8.0
 pytest-asyncio>=0.23
 pytest-cov>=4.0
+pytest-timeout>=2.3  # required by pytest.ini addopts (--timeout=60)
